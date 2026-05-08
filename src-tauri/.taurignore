@@ -1,0 +1,29 @@
+# Tauri 2's dev-mode file watcher uses this file (gitignore-syntax) to
+# decide what to ignore inside src-tauri/. Without it, sing-box's
+# runtime artefacts (rule-set cache, downloaded UI bundle, latency
+# history) trigger a rebuild loop:
+#
+#   "File src-tauri\cache.db changed. Rebuilding application..."
+#
+# fires every few seconds while the proxy is up.
+
+# sing-box rule-set cache + URL-test latency history. Written to CWD
+# whenever sing-box runs; on Windows dev this lands in src-tauri/.
+cache.db
+cache.db-journal
+
+# External clash dashboard sing-box auto-downloads when experimental.clash_api
+# .external_ui is set. Same anchor reasoning as the gitignore rule.
+ui/
+
+# Runtime config + .bak files our own app writes via atomic_write —
+# these aren't in src-tauri/ usually, but be defensive.
+*.bak
+*.bak.1
+*.bak.2
+*.bak.3
+
+# Build/CI artefacts the cargo watch already covers — but listing them
+# here is harmless and keeps the watcher quiet.
+target/
+gen/

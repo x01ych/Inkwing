@@ -1,0 +1,140 @@
+name: release
+
+# Builds installable artefacts for Linux, Windows, and macOS (Apple
+# Silicon only) on:
+#   - a tag matching v* (cuts a draft GitHub Release with the artefacts
+#     attached — review and publish manually)
+#   - manual dispatch via the Actions tab
+#
+# Plain pushes to main do NOT trigger CI: builds run only when you cut
+# a release tag, keeping Actions minutes cheap during day-to-day work.
+#
+# Code signing is not configured: macOS bundles are unsigned (Gatekeeper
+# warning on first launch), Windows .exe is unsigned (SmartScreen
+# warning). Sign in a follow-up commit when you have certificates.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# tauri-action needs contents: write to create the draft Release and
+# upload assets to it. Default GITHUB_TOKEN is read-only on fresh
+# repos, which is why a tagged build fails with "Resource not
+# accessible by integration".
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            label: linux
+            tauri-target: ''
+          - os: windows-latest
+            label: windows
+            tauri-target: ''
+          - os: macos-14
+            label: macos-arm64
+            tauri-target: 'aarch64-apple-darwin'
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- Toolchains ---------------------------------------------------
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          run_install: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.tauri-target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      # ---- Linux system deps -------------------------------------------
+      - name: Install Linux deps (Tauri 2)
+        if: matrix.label == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config curl wget file \
+            libssl-dev libdbus-1-dev libgtk-3-dev \
+            libwebkit2gtk-4.1-dev libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev librsvg2-dev libxdo-dev \
+            libayatana-appindicator3-dev
+
+      # ---- Pull sing-box + wintun --------------------------------------
+      - name: Fetch sing-box (Linux)
+        if: matrix.label == 'linux'
+        run: node scripts/fetch-singbox.mjs --skip-foreign
+
+      - name: Fetch sing-box + wintun (Windows)
+        if: matrix.label == 'windows'
+        shell: pwsh
+        run: node scripts/fetch-singbox.mjs --skip-foreign
+
+      - name: Fetch sing-box (macOS)
+        if: startsWith(matrix.label, 'macos')
+        run: node scripts/fetch-singbox.mjs --skip-foreign
+
+      # ---- Front-end deps ----------------------------------------------
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      # ---- Tauri build --------------------------------------------------
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # On a tag push, cut a draft release. Otherwise just build.
+          tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/v') && format('Inkwing {0}', github.ref_name) || '' }}
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.tauri-target && format('--target {0}', matrix.tauri-target) || '' }}
+
+      # ---- Always upload artefacts on non-tag pushes -------------------
+      - name: Upload artefacts (Linux)
+        if: matrix.label == 'linux' && !startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-bundles
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload artefacts (Windows)
+        if: matrix.label == 'windows' && !startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-bundles
+          path: |
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+            src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload artefacts (macOS)
+        if: startsWith(matrix.label, 'macos') && !startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}-bundles
+          path: |
+            src-tauri/target/${{ matrix.tauri-target }}/release/bundle/macos/*.app
+            src-tauri/target/${{ matrix.tauri-target }}/release/bundle/dmg/*.dmg
+          if-no-files-found: warn
+          retention-days: 14

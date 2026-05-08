@@ -1,0 +1,28 @@
+# Default: let git autodetect text files and normalize EOLs to LF in the repo.
+* text=auto eol=lf
+
+# Shell scripts must always be LF (or bash will error in containers).
+*.sh text eol=lf
+
+# Windows scripts must be CRLF.
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Lockfiles are text but never hand-edited; keep stable.
+pnpm-lock.yaml -diff
+Cargo.lock -diff
+
+# Binaries / archives — never touch.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.pdf binary
+*.zip binary
+*.tar.gz binary
+*.dll binary
+*.exe binary
+*.so binary
+*.dylib binary

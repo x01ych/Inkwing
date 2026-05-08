@@ -1,0 +1,50 @@
+# Node
+node_modules/
+dist/
+.vite/
+.pnpm-store/
+
+# TS incremental build artefacts
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+
+# Tauri / Rust
+src-tauri/target/
+src-tauri/gen/
+
+# Sidecar binaries (re-fetch via scripts/fetch-singbox.mjs)
+src-tauri/binaries/sing-box-*
+src-tauri/binaries/wintun-*.dll
+src-tauri/binaries/VERSION.json
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local Claude Code per-project state
+.claude/
+!.claude/.gitkeep
+
+# Logs
+*.log
+
+# Local-only settings
+.env
+.env.local
+
+# Real, user-supplied sing-box configs used for local dev / regression
+# tests only — NEVER commit (likely contains live server credentials).
+configs-local/
+
+# Runtime artefacts written by sing-box when it runs from the project
+# CWD (regression test, dev container). cache.db holds rule-set cache
+# + URL-test latency history (potentially sensitive). /ui is the
+# external dashboard sing-box auto-downloads at the repo root — anchor
+# with a leading slash so it doesn't shadow src/components/ui/ (shadcn).
+/cache.db
+/ui/
+
+# Docker volumes (managed by docker; nothing to ignore in workspace)
+

@@ -1,0 +1,59 @@
+{
+  "nav": {
+    "dashboard": "仪表盘",
+    "config": "配置",
+    "proxies": "代理",
+    "route": "路由",
+    "dns": "DNS",
+    "logs": "日志",
+    "connections": "连接",
+    "settings": "设置"
+  },
+  "sidebar": {
+    "mode": "模式",
+    "mode_rule": "规则",
+    "mode_global": "全局",
+    "mode_direct": "直连",
+    "tun": "TUN",
+    "expand": "展开",
+    "collapse": "收起",
+    "mode_tooltip": "模式：{{mode}}（点击循环切换）",
+    "tun_tooltip": "TUN {{state}} — 点击切换",
+    "tun_help": "运行时切换 TUN 入站（不会修改你的配置文件）"
+  },
+  "tun_dialog": {
+    "title": "开启 TUN 需要提权",
+    "linux_body": "Inkwing 需要给打包的 sing-box 二进制赋予 CAP_NET_ADMIN，才能打开 TUN 设备。点击「授权」会通过 PolicyKit 弹出系统密码框（一次性，下次开 TUN 不再询问）。",
+    "windows_body": "Windows 上 TUN 必须以管理员身份运行。Inkwing 会关闭并以提权方式重新启动，系统会弹出 UAC 确认框。你的配置库和设置不会丢失，仅当前页面状态会重置。",
+    "macos_body": "macOS 管理 TUN 网络设备需要管理员授权，会请求 Touch ID 或密码。注意：每次 sing-box 重启（切换模式 / 切换配置 / 重启 app）都会再次询问，直到我们拿到 Apple 开发者证书签名 + NetworkExtension entitlement 后才能消除。",
+    "hint_label": "系统提示",
+    "cancel": "暂不",
+    "grant_linux": "授权",
+    "grant_windows": "以管理员身份重启",
+    "grant_macos": "授权",
+    "grant_other": "好",
+    "granting": "授权中…",
+    "grant_failed": "授权失败：{{message}}",
+    "grant_success": "TUN 已授权",
+    "windows_relaunching": "正在以管理员身份重启 Inkwing…"
+  },
+  "settings": {
+    "title": "设置",
+    "behaviour": "行为",
+    "minimize_to_tray": "最小化到托盘",
+    "minimize_to_tray_desc": "启用后，关闭窗口会隐藏到系统托盘而不是退出。使用托盘菜单中的「退出」彻底关闭。",
+    "autostart": "开机启动",
+    "autostart_desc": "把 Inkwing 加入操作系统自启项。",
+    "latency": "延迟测试",
+    "test_url": "测试 URL",
+    "test_url_desc": "代理页测试节点延迟时访问的 URL，需要响应快速（HTTP/204 之类）。默认使用 Google 的 gstatic generate_204。",
+    "appearance": "外观与语言",
+    "theme": "主题",
+    "theme_dark": "深色",
+    "theme_light": "浅色",
+    "accent": "强调色",
+    "accent_desc": "影响按钮 / 选中标记 / 聚焦环的颜色，背景保持中性。",
+    "language": "语言",
+    "language_note": "目前仅翻译了侧边栏 / 设置页的标签；其他页面的字符串后续会陆续迁移。"
+  }
+}

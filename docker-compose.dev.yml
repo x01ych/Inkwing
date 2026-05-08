@@ -1,0 +1,60 @@
+# Dev container for Inkwing (Tauri 2 + React).
+# Use via scripts/dev-container.sh, or directly:
+#   docker compose -f docker-compose.dev.yml up -d --build
+#   docker compose -f docker-compose.dev.yml exec dev bash
+#
+# Inside the container:
+#   pnpm install
+#   sudo setcap 'cap_net_admin,cap_net_bind_service=+ep' \
+#     src-tauri/binaries/sing-box-x86_64-unknown-linux-gnu
+#   pnpm tauri dev
+#
+# Open http://<host>:6080/vnc.html in any browser to see the Tauri window.
+
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      args:
+        USER_ID: "${UID:-1000}"
+        GROUP_ID: "${GID:-1000}"
+    image: inkwing-dev:latest
+    container_name: inkwing-dev
+    hostname: inkwing-dev
+    init: true
+    # NET_ADMIN + tun device so sing-box can bring up TUN inside the container.
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    # 1420 = vite dev server, 6080 = noVNC web client. Bind to loopback only;
+    # if the host is remote, ssh -L 6080:localhost:6080 to view in a local browser.
+    ports:
+      - "127.0.0.1:1420:1420"
+      - "127.0.0.1:6080:6080"
+    volumes:
+      - .:/workspace
+      # Cargo registry/git/target as named volumes so first build's ~5min
+      # download isn't repeated, and so we don't cross-pollute host targets.
+      - cargo-registry:/home/dev/.cargo/registry
+      - cargo-git:/home/dev/.cargo/git
+      - cargo-target:/workspace/src-tauri/target
+      # node_modules as a named volume — host's pnpm-installed tree (built
+      # against host's libc paths) shouldn't leak in.
+      - node-modules:/workspace/node_modules
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    environment:
+      DISPLAY: ":1"
+      RUST_BACKTRACE: "1"
+      # Speed: incremental compile + cargo's sparse registry index.
+      CARGO_INCREMENTAL: "1"
+      CARGO_REGISTRIES_CRATES_IO_PROTOCOL: "sparse"
+
+volumes:
+  cargo-registry:
+  cargo-git:
+  cargo-target:
+  node-modules:

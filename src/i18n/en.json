@@ -1,0 +1,59 @@
+{
+  "nav": {
+    "dashboard": "Dashboard",
+    "config": "Config",
+    "proxies": "Proxies",
+    "route": "Route",
+    "dns": "DNS",
+    "logs": "Logs",
+    "connections": "Connections",
+    "settings": "Settings"
+  },
+  "sidebar": {
+    "mode": "Mode",
+    "mode_rule": "Rule",
+    "mode_global": "Global",
+    "mode_direct": "Direct",
+    "tun": "TUN",
+    "expand": "Expand",
+    "collapse": "Collapse",
+    "mode_tooltip": "Mode: {{mode}} (click to cycle)",
+    "tun_tooltip": "TUN {{state}} — click to toggle",
+    "tun_help": "Toggle TUN inbound at runtime (does not modify your config file)"
+  },
+  "tun_dialog": {
+    "title": "TUN mode needs elevated privileges",
+    "linux_body": "Inkwing needs to grant CAP_NET_ADMIN to the bundled sing-box binary so it can open the TUN device. Click Grant to authorise via PolicyKit (one-time setup — future TUN sessions won't ask).",
+    "windows_body": "TUN mode requires Administrator on Windows. Inkwing will close and re-open elevated; Windows will show a UAC prompt. Your library and settings are preserved; the current page state will reset.",
+    "macos_body": "macOS requires admin authorisation to manage TUN network devices. Touch ID or your password will be requested. Note: macOS re-prompts every time sing-box restarts (mode/config changes, app launch). A signed build with NetworkExtension entitlement will eventually fix this.",
+    "hint_label": "System hint",
+    "cancel": "Not now",
+    "grant_linux": "Grant capability",
+    "grant_windows": "Restart as Administrator",
+    "grant_macos": "Authorise",
+    "grant_other": "OK",
+    "granting": "Authorising…",
+    "grant_failed": "Authorisation failed: {{message}}",
+    "grant_success": "TUN authorised",
+    "windows_relaunching": "Restarting Inkwing with administrator privileges…"
+  },
+  "settings": {
+    "title": "Settings",
+    "behaviour": "Behaviour",
+    "minimize_to_tray": "Minimize to tray",
+    "minimize_to_tray_desc": "When enabled, closing the window hides it to the system tray instead of quitting. Use the tray menu's Quit to exit fully.",
+    "autostart": "Launch on login",
+    "autostart_desc": "Adds Inkwing to your OS auto-start.",
+    "latency": "Latency test",
+    "test_url": "Test URL",
+    "test_url_desc": "URL the Proxies page hits when testing node latency. Should respond fast (HTTP/204 or similar). Default uses Google's gstatic generate_204.",
+    "appearance": "Appearance & language",
+    "theme": "Theme",
+    "theme_dark": "Dark",
+    "theme_light": "Light",
+    "accent": "Accent color",
+    "accent_desc": "Changes button / active-marker / focus-ring colour. Surfaces stay neutral.",
+    "language": "Language",
+    "language_note": "Sidebar / settings labels are translated; deeper page strings will migrate over time."
+  }
+}
