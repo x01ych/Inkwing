@@ -319,6 +319,32 @@ pub async fn config_active_summary(
     Ok(active_summary_from_cache(&state))
 }
 
+/// Re-read the active config from disk into `state.config.{raw,parsed}`.
+/// Useful when the user has edited their source JSON outside Inkwing
+/// (e.g. with a text editor) and the in-memory cache has gone stale.
+/// Returns a fresh summary so the caller can update its store in one
+/// round-trip. Errors propagate if the file is missing / unreadable
+/// — those are surfaced verbatim by the frontend.
+#[tauri::command]
+pub async fn config_reload_active(
+    state: State<'_, AppState>,
+) -> AppResult<Option<config::ConfigSummary>> {
+    let path = {
+        let g = state.config.lock();
+        g.path.clone()
+    };
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let (raw, parsed) = config::load_from_path(&path)?;
+    {
+        let mut g = state.config.lock();
+        g.raw = Some(raw);
+        g.parsed = Some(parsed);
+    }
+    Ok(active_summary_from_cache(&state))
+}
+
 fn active_summary_from_cache(state: &State<'_, AppState>) -> Option<config::ConfigSummary> {
     let g = state.config.lock();
     match (g.path.as_ref(), g.raw.as_ref(), g.parsed.as_ref()) {

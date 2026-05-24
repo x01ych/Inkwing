@@ -101,6 +101,7 @@ pub fn run() {
             commands::config_cmd::config_library_reveal,
             commands::config_cmd::config_library_refresh_from_subscription,
             commands::config_cmd::config_active_summary,
+            commands::config_cmd::config_reload_active,
             commands::proxies_cmd::proxies_list,
             commands::proxies_cmd::proxies_select,
             commands::proxies_cmd::proxies_test,

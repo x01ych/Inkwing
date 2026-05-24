@@ -24,6 +24,7 @@ import {
   type Scope,
   type RuleInput,
 } from '../api/rules';
+import { configApi } from '../api/config';
 import { useConfigStore } from '../store/configStore';
 import { useCoreStore } from '../store/coreStore';
 import {
@@ -811,7 +812,22 @@ function RuleSetsTab() {
             {list.length === 0 ? (
               <TableRow>
                 <TableCell colSpan={7} className="py-6">
-                  <RuleSetsEmptyState probe={probe} configPath={summary.path} />
+                  <RuleSetsEmptyState
+                    probe={probe}
+                    configPath={summary.path}
+                    onReload={async () => {
+                      try {
+                        const fresh = await configApi.reloadActive();
+                        if (fresh) useConfigStore.getState().setSummary(fresh);
+                        await refresh();
+                        toast.success('Reloaded config from disk');
+                      } catch (e) {
+                        toast.error(
+                          'Reload failed: ' + String((e as Error)?.message ?? e)
+                        );
+                      }
+                    }}
+                  />
                 </TableCell>
               </TableRow>
             ) : (
@@ -1056,9 +1072,11 @@ function formatRelativeAgo(ts: number): string {
 function RuleSetsEmptyState({
   probe,
   configPath,
+  onReload,
 }: {
   probe: RouteProbeReport | null;
   configPath: string;
+  onReload: () => void | Promise<void>;
 }) {
   const cause: { headline: string; hint: React.ReactNode } = (() => {
     if (!probe) {
@@ -1150,11 +1168,21 @@ function RuleSetsEmptyState({
   })();
 
   return (
-    <div className="space-y-1.5 text-sm text-muted-foreground">
+    <div className="space-y-2 text-sm text-muted-foreground">
       <div className="font-medium text-foreground">{cause.headline}</div>
       <div className="text-xs">{cause.hint}</div>
       <div className="text-[11px] text-muted-foreground">
         Active source: <code className="text-[11px]">{configPath}</code>
+      </div>
+      <div className="pt-1">
+        <Button size="sm" variant="outline" onClick={onReload}>
+          <RotateCcw className="h-3.5 w-3.5" />
+          Reload config from disk
+        </Button>
+        <p className="mt-1 text-[11px] text-muted-foreground">
+          Click if you edited the source JSON outside Inkwing — refreshes the in-memory cache
+          and re-renders the table.
+        </p>
       </div>
     </div>
   );

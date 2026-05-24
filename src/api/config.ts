@@ -79,6 +79,11 @@ export const configApi = {
    * backend cache. None when nothing is active. Used by App.tsx at boot
    * and after `library:changed` events. */
   activeSummary: () => invoke<ConfigSummary | null>('config_active_summary'),
+  /** Re-read the active config from disk into the backend cache.
+   * Use when the user edited the source JSON externally (text editor)
+   * and we need to invalidate the cached parsed Value. */
+  reloadActive: () =>
+    invoke<ConfigSummary | null>('config_reload_active'),
   libraryView: (id: string) => invoke<string>('config_library_view', { id }),
   libraryReveal: (id: string) =>
     invoke<void>('config_library_reveal', { id }),
