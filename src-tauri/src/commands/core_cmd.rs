@@ -3,6 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_store::StoreExt;
 
 use crate::core::clash_api::ClashClient;
 use crate::core::clash_inject::{
@@ -90,61 +91,14 @@ pub async fn core_start(
         }
     }
 
-    // 1. Snapshot the parsed user config (we don't write to it).
-    let user_value = {
-        let cfg = state.config.lock();
-        cfg.parsed
-            .clone()
-            .ok_or_else(|| AppError::Config("no config loaded — open one first".into()))?
-    };
-
-    // 2. Inject experimental.clash_api with a port + secret we control,
-    //    then apply the runtime TUN + local-ports overlays (from settings).
-    let mut injected = inject_clash_api(&user_value)?;
+    // 1-2-3. Compose the merged runtime config and write it to disk.
+    //        Also used by `singbox_versions_select` to dry-run a candidate
+    //        binary's `sing-box check` before swapping the live core.
     let s = crate::commands::settings_cmd::current_settings(&app);
-    // Order matters: mode overlay rewrites route.rules / route.final, so it
-    // must run before any later step that might inspect routes. TUN +
-    // local ports only touch inbounds, so they're independent of mode.
-    apply_mode_overlay(&mut injected.merged, &s.proxy_mode)?;
-    apply_tun_overlay(&mut injected.merged, Some(s.tun_enabled))?;
-    apply_local_ports_overlay(
-        &mut injected.merged,
-        s.mixed_port,
-        s.socks_port,
-        s.http_port,
-    )?;
-    // Force cache_file.path to an absolute path under our data dir so an
-    // orphan sing-box (likely on macOS / Linux where we have no Job Object
-    // equivalent) holding a stale ./cache.db lock can't deadlock us with
-    // "initialize cache-file: timeout".
-    let cache_path = cache_file_path()?;
-    if let Some(parent) = cache_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    apply_cache_file_overlay(&mut injected.merged, &cache_path)?;
-
-    // Merge user-managed overrides (per-config + global) *after* every
-    // other overlay. The user's source config file is never modified;
-    // their GUI-level rule edits live in
-    // <data_dir>/overrides/{<entry_id>.json,global.json} and only
-    // appear here in the runtime/config.json that sing-box reads.
-    {
-        let active_id = state.config.lock().active_id.clone();
-        let per = match active_id {
-            Some(ref id) => crate::core::overrides::load_per_config(
-                &per_config_overrides_path(id)?,
-            ),
-            None => crate::core::overrides::LocalOverrides::default(),
-        };
-        let global =
-            crate::core::overrides::load_global(&global_overrides_path()?);
-        crate::core::overrides::apply_overrides_overlay(&mut injected.merged, &per, &global)?;
-    }
-
-    // 3. Write merged config to <data_dir>/runtime/config.json (atomic).
-    let runtime_path = runtime_config_path()?;
-    let bytes = serde_json::to_vec_pretty(&injected.merged)?;
+    let (composed, runtime_path) = compose_runtime_config(&app, &state, &s)?;
+    let bytes = serde_json::to_vec_pretty(&composed.merged)?;
     atomic_write(&runtime_path, &bytes)?;
+    let injected = composed;
 
     // 4. Spawn sing-box run -c <runtime_path>.
     //    macOS without an entitlement cannot manage TUN devices unless
@@ -158,7 +112,15 @@ pub async fn core_start(
     };
     #[cfg(not(target_os = "macos"))]
     let elevation = ElevationMode::None;
-    let handle = spawn_run(&app, &runtime_path, elevation)?;
+    // Resolve any user-selected non-bundled sing-box version (None ⇒
+    // use the Tauri-bundled sidecar).
+    let binary_override = crate::core::binaries::resolve_selected_binary(&s);
+    let handle = spawn_run(
+        &app,
+        &runtime_path,
+        elevation,
+        binary_override.as_deref(),
+    )?;
     let pid = handle.pid;
 
     // 5. Wait for /version. Rule-set heavy configs need >10s on first
@@ -335,6 +297,61 @@ pub async fn core_restart(
     core_start(app, state).await
 }
 
+/// Build the merged runtime config (user config ⊕ clash_api injection ⊕
+/// mode/TUN/local-ports/cache-file overlays ⊕ per-config + global
+/// overrides). Returns the composed `InjectedConfig` and the on-disk
+/// destination path, but does NOT write the file — the caller decides
+/// whether this is the live runtime path or a `_check.json` scratch
+/// file for pre-flight validation.
+pub(crate) fn compose_runtime_config(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    s: &crate::commands::settings_cmd::Settings,
+) -> AppResult<(crate::core::clash_inject::InjectedConfig, std::path::PathBuf)> {
+    // 1. Snapshot the parsed user config (we don't write to it).
+    let user_value = {
+        let cfg = state.config.lock();
+        cfg.parsed
+            .clone()
+            .ok_or_else(|| AppError::Config("no config loaded — open one first".into()))?
+    };
+
+    // 2. Inject experimental.clash_api with a port + secret we control,
+    //    then apply runtime overlays from settings.
+    let mut injected = inject_clash_api(&user_value)?;
+    apply_mode_overlay(&mut injected.merged, &s.proxy_mode)?;
+    apply_tun_overlay(&mut injected.merged, Some(s.tun_enabled))?;
+    apply_local_ports_overlay(
+        &mut injected.merged,
+        s.mixed_port,
+        s.socks_port,
+        s.http_port,
+    )?;
+    let cache_path = cache_file_path()?;
+    if let Some(parent) = cache_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    apply_cache_file_overlay(&mut injected.merged, &cache_path)?;
+
+    // Merge per-config + global overrides.
+    {
+        let active_id = state.config.lock().active_id.clone();
+        let per = match active_id {
+            Some(ref id) => crate::core::overrides::load_per_config(
+                &per_config_overrides_path(id)?,
+            ),
+            None => crate::core::overrides::LocalOverrides::default(),
+        };
+        let global =
+            crate::core::overrides::load_global(&global_overrides_path()?);
+        crate::core::overrides::apply_overrides_overlay(&mut injected.merged, &per, &global)?;
+    }
+
+    let runtime_path = runtime_config_path()?;
+    let _ = app; // currently unused but kept for future overlay extensions
+    Ok((injected, runtime_path))
+}
+
 #[derive(Debug, Serialize)]
 pub struct PrivilegeReport {
     pub tun_capable: bool,
@@ -386,6 +403,108 @@ pub(crate) fn resolve_singbox_binary_path() -> Option<std::path::PathBuf> {
 }
 
 /// Check whether the bundled sing-box binary can bring up TUN. Linux:
+// ---------- multi-version sing-box management ----------------------------
+
+#[tauri::command]
+pub async fn singbox_versions_list() -> AppResult<Vec<crate::core::binaries::InstalledBinary>> {
+    crate::core::binaries::list_installed()
+}
+
+#[tauri::command]
+pub async fn singbox_versions_list_remote(
+) -> AppResult<Vec<crate::core::binaries::ReleaseAsset>> {
+    crate::core::binaries::list_remote().await
+}
+
+#[tauri::command]
+pub async fn singbox_versions_download(
+    version: String,
+    asset_url: String,
+) -> AppResult<crate::core::binaries::InstalledBinary> {
+    crate::core::binaries::download(&version, &asset_url).await
+}
+
+#[tauri::command]
+pub async fn singbox_versions_delete(version: String) -> AppResult<()> {
+    crate::core::binaries::delete(&version)
+}
+
+/// Switch to a different sing-box binary:
+///   1. Build the current runtime config (same overlays as core_start).
+///   2. Run `<new binary> check -c <scratch path>` to validate that the
+///      candidate version accepts the merged JSON.
+///   3. If OK: persist the choice, restart the core under the new binary.
+///   4. If not OK: leave settings/core untouched and return the report.
+///
+/// `version == "bundled"` reverts to the Tauri-bundled sidecar.
+#[tauri::command]
+pub async fn singbox_versions_select(
+    version: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<crate::core::validate::ValidationReport> {
+    let _guard = state.settings_op.lock().await;
+    let mut settings = crate::commands::settings_cmd::current_settings(&app);
+    let target_override: Option<std::path::PathBuf> = if version == "bundled" || version.is_empty() {
+        None
+    } else {
+        let dir = crate::core::binaries::version_dir(&version)?;
+        let p = dir.join(if cfg!(target_os = "windows") { "sing-box.exe" } else { "sing-box" });
+        if !p.is_file() {
+            return Err(AppError::Other(format!(
+                "version '{version}' is not installed (no binary at {})",
+                p.display()
+            )));
+        }
+        Some(p)
+    };
+
+    // Pretend the new version is selected, just for compose. Don't
+    // persist yet — only do that after validation passes.
+    settings.selected_singbox_version =
+        if version == "bundled" { None } else { Some(version.clone()) };
+
+    // Compose runtime config + write to a scratch file we can pass to
+    // `sing-box check`. We avoid clobbering the live runtime/config.json
+    // in case the user cancels.
+    let (composed, runtime_path) = compose_runtime_config(&app, &state, &settings)?;
+    let scratch = runtime_path.with_file_name("_check.json");
+    if let Some(parent) = scratch.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let bytes = serde_json::to_vec_pretty(&composed.merged)?;
+    crate::util::atomic_write::atomic_write(&scratch, &bytes)?;
+
+    let report =
+        crate::core::validate::validate_with_binary(&app, target_override.as_deref(), &scratch)
+            .await?;
+    let _ = std::fs::remove_file(&scratch);
+    if !report.ok {
+        return Ok(report);
+    }
+
+    // Validation passed → persist the selection and restart.
+    {
+        let mut to_save = crate::commands::settings_cmd::current_settings(&app);
+        to_save.selected_singbox_version =
+            if version == "bundled" { None } else { Some(version.clone()) };
+        let v = serde_json::to_value(&to_save)?;
+        let store = app
+            .store(crate::commands::settings_cmd::STORE_FILE)
+            .map_err(|e| AppError::Other(format!("open settings store: {e}")))?;
+        store.set(crate::commands::settings_cmd::SETTINGS_KEY, v);
+        store
+            .save()
+            .map_err(|e| AppError::Other(format!("save settings store: {e}")))?;
+    }
+    // Drop the settings_op guard before core_start, which needs to
+    // re-read settings inside its own State borrow.
+    drop(_guard);
+    let _ = core_stop(app.clone(), state.clone()).await;
+    let _ = core_start(app, state).await?;
+    Ok(report)
+}
+
 /// inspect file capabilities. Windows: check whether our own process token
 /// is elevated (sing-box inherits). macOS: always reports false because
 /// authorization is per-session via osascript admin shell — the toggle

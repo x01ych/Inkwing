@@ -48,6 +48,11 @@ once_cell = "1"
 parking_lot = "0.12"
 urlencoding = "2"
 futures = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+jammdb = "0.11"
+tar = "0.4"
+flate2 = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 caps = "0.5"

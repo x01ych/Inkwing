@@ -286,6 +286,16 @@ pub struct RuleSetView {
     pub update_interval: Option<String>,
     pub readonly_reason: String,
     pub raw_pretty: String,
+    /// Populated from sing-box's cache.db at list time. None when no
+    /// cache entry exists yet (sing-box hasn't run against this tag,
+    /// or it's a local-type rule_set).
+    #[serde(default)]
+    pub last_updated_ms: Option<u64>,
+    /// HTTP ETag last seen by sing-box for this remote rule_set. Used
+    /// by sing-box for If-None-Match to avoid re-downloading unchanged
+    /// content. Surfaced as diagnostic only.
+    #[serde(default)]
+    pub etag: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -331,6 +341,8 @@ pub fn rule_set_to_view(idx: usize, v: &Value) -> RuleSetView {
                 update_interval: None,
                 readonly_reason: "rule_set entry is not an object".into(),
                 raw_pretty,
+                last_updated_ms: None,
+                etag: None,
             };
         }
     };
@@ -381,6 +393,8 @@ pub fn rule_set_to_view(idx: usize, v: &Value) -> RuleSetView {
         update_interval,
         readonly_reason,
         raw_pretty,
+        last_updated_ms: None,
+        etag: None,
     }
 }
 

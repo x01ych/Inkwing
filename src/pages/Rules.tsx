@@ -3,8 +3,10 @@ import {
   Eye,
   EyeOff,
   GripVertical,
+  Loader2,
   Pencil,
   Plus,
+  RefreshCw,
   RotateCcw,
   Save,
   Trash2,
@@ -585,6 +587,8 @@ function RuleSetsTab() {
   const [editOpen, setEditOpen] = useState(false);
   const [committing, setCommitting] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<RuleSetViewWithBadge | null>(null);
+  const [refreshingTags, setRefreshingTags] = useState<Set<string>>(new Set());
+  const [refreshingAll, setRefreshingAll] = useState(false);
 
   async function refresh() {
     setLoadErr('');
@@ -676,6 +680,47 @@ function RuleSetsTab() {
     }
   }
 
+  async function handleRefreshOne(rs: RuleSetViewWithBadge) {
+    const tag = rs.view.tag;
+    setRefreshingTags((prev) => new Set(prev).add(tag));
+    try {
+      const result = await ruleSetsApi.refresh(tag);
+      if (result.ok) {
+        toast.success(`Refreshed "${tag}" — sing-box restarted`);
+      } else {
+        toast.error(`Refresh "${tag}" had errors: ${result.error ?? 'unknown'}`);
+      }
+      await refresh();
+    } catch (e) {
+      toast.error(String((e as Error)?.message ?? e));
+    } finally {
+      setRefreshingTags((prev) => {
+        const next = new Set(prev);
+        next.delete(tag);
+        return next;
+      });
+    }
+  }
+
+  async function handleRefreshAll() {
+    setRefreshingAll(true);
+    try {
+      const results = await ruleSetsApi.refreshAll();
+      const ok = results.filter((r) => r.ok).length;
+      const failed = results.length - ok;
+      if (failed === 0) {
+        toast.success(`Refreshed ${ok} rule_set(s) — sing-box restarted`);
+      } else {
+        toast.error(`Refreshed ${ok}, ${failed} failed (see Logs)`);
+      }
+      await refresh();
+    } catch (e) {
+      toast.error(String((e as Error)?.message ?? e));
+    } finally {
+      setRefreshingAll(false);
+    }
+  }
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between gap-2">
@@ -687,6 +732,20 @@ function RuleSetsTab() {
           <Button size="sm" onClick={openAdd}>
             <Plus className="h-4 w-4" />
             Add rule_set
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={refreshingAll || refreshingTags.size > 0 || list.every((r) => r.view.kind !== 'remote')}
+            onClick={handleRefreshAll}
+            title="Wipe sing-box's rule_set cache and restart. Every remote rule_set re-downloads on start."
+          >
+            {refreshingAll ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <RefreshCw className="h-4 w-4" />
+            )}
+            Refresh all
           </Button>
           <Button
             size="sm"
@@ -729,8 +788,8 @@ function RuleSetsTab() {
               <TableHead className="w-24">Type</TableHead>
               <TableHead className="w-24">Format</TableHead>
               <TableHead>Source URL/Path</TableHead>
-              <TableHead className="w-24">Update</TableHead>
-              <TableHead className="w-32">Actions</TableHead>
+              <TableHead className="w-40">Last update</TableHead>
+              <TableHead className="w-36">Actions</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -779,9 +838,7 @@ function RuleSetsTab() {
                     </code>
                   </TableCell>
                   <TableCell className="text-sm">
-                    {row.view.update_interval || (
-                      <span className="text-muted-foreground">—</span>
-                    )}
+                    <RuleSetLastUpdateCell row={row} />
                   </TableCell>
                   <TableCell>
                     <div className="flex items-center gap-1">
@@ -841,6 +898,28 @@ function RuleSetsTab() {
                                 <TooltipContent>Mask</TooltipContent>
                               </Tooltip>
                             ))}
+                          {row.view.kind === 'remote' && !row.masked && (
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-7 w-7"
+                                  disabled={refreshingTags.has(row.view.tag) || refreshingAll}
+                                  onClick={() => handleRefreshOne(row)}
+                                >
+                                  {refreshingTags.has(row.view.tag) ? (
+                                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                  ) : (
+                                    <RefreshCw className="h-3.5 w-3.5" />
+                                  )}
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent>
+                                Force sing-box to re-download (restarts core)
+                              </TooltipContent>
+                            </Tooltip>
+                          )}
                           {row.source !== 'config' && (
                             <Button
                               variant="ghost"
@@ -899,4 +978,56 @@ function RuleSetsTab() {
       </AlertDialog>
     </div>
   );
+}
+
+function RuleSetLastUpdateCell({ row }: { row: RuleSetViewWithBadge }) {
+  const ts = row.view.last_updated_ms;
+  const interval = row.view.update_interval;
+
+  if (row.view.kind !== 'remote') {
+    return <span className="text-muted-foreground">—</span>;
+  }
+  if (!ts) {
+    return (
+      <div className="flex flex-col gap-0.5">
+        <span className="text-muted-foreground">Never</span>
+        {interval && (
+          <span className="text-[10px] text-muted-foreground">interval: {interval}</span>
+        )}
+      </div>
+    );
+  }
+  const relative = formatRelativeAgo(ts);
+  const absolute = new Date(ts).toLocaleString();
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <div className="flex cursor-default flex-col gap-0.5">
+          <span>{relative}</span>
+          {interval && (
+            <span className="text-[10px] text-muted-foreground">interval: {interval}</span>
+          )}
+        </div>
+      </TooltipTrigger>
+      <TooltipContent>
+        <div className="text-xs">
+          <div>Last updated: {absolute}</div>
+          {row.view.etag && <div>etag: {row.view.etag}</div>}
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+function formatRelativeAgo(ts: number): string {
+  const delta = Date.now() - ts;
+  if (delta < 0) return 'in the future';
+  const sec = Math.round(delta / 1000);
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.round(sec / 60);
+  if (min < 60) return `${min} min ago`;
+  const hr = Math.round(min / 60);
+  if (hr < 24) return `${hr} h ago`;
+  const d = Math.round(hr / 24);
+  return `${d} d ago`;
 }

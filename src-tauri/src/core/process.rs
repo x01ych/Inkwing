@@ -25,6 +25,51 @@ pub enum ElevationMode {
     MacosAdmin,
 }
 
+/// One-shot run of `<binary> <args>`, capture stdout, return on exit.
+/// Used by `validate_with_binary` so the Apply flow can dry-run a
+/// candidate version's `sing-box check` against the merged runtime
+/// config before swapping the live core.
+pub async fn run_binary_oneshot(binary: &Path, args: &[&str]) -> AppResult<String> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut child = tokio::process::Command::new(binary)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| AppError::Sidecar(format!("spawn {}: {}", binary.display(), e)))?;
+
+    let mut stdout_buf = String::new();
+    let mut stderr_buf = String::new();
+    if let Some(out) = child.stdout.take() {
+        let mut r = BufReader::new(out).lines();
+        while let Ok(Some(line)) = r.next_line().await {
+            stdout_buf.push_str(&line);
+            stdout_buf.push('\n');
+        }
+    }
+    if let Some(err) = child.stderr.take() {
+        let mut r = BufReader::new(err).lines();
+        while let Ok(Some(line)) = r.next_line().await {
+            stderr_buf.push_str(&line);
+            stderr_buf.push('\n');
+        }
+    }
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| AppError::Sidecar(format!("wait {}: {}", binary.display(), e)))?;
+    if status.success() {
+        Ok(stdout_buf.trim_end().to_string())
+    } else {
+        Err(AppError::SingBoxFailed(format!(
+            "exit {}\nstderr:\n{}",
+            status.code().unwrap_or(-1),
+            stderr_buf.trim_end()
+        )))
+    }
+}
+
 /// One-shot run of `sing-box <args>`, capture stdout, return on exit.
 /// Used for `version` and `check`. NOT for `run`.
 pub async fn run_sidecar_oneshot(app: &AppHandle, args: &[&str]) -> AppResult<String> {
@@ -73,14 +118,13 @@ pub async fn run_sidecar_oneshot(app: &AppHandle, args: &[&str]) -> AppResult<St
 }
 
 /// Two flavours of running child: the normal Tauri sidecar (preferred)
-/// and a native std-process child used only on macOS when sing-box has
-/// to be re-launched under `osascript with administrator privileges`.
-/// The macOS variant uses `Arc<Mutex<Option<Child>>>` so the kill path
-/// and the exit-watcher thread can both operate on the same Child
-/// without `Clone` (try_wait + kill from different sites).
+/// and a native std-process child. The native variant is used in two
+/// cases: macOS admin (osascript wrapper) and user-selected non-bundled
+/// sing-box versions on any platform. Uses
+/// `Arc<Mutex<Option<Child>>>` so the kill path and the exit-watcher
+/// thread can both operate on the same Child without `Clone`.
 pub enum ChildHandle {
     Sidecar(CommandChild),
-    #[cfg(target_os = "macos")]
     NativeShared(std::sync::Arc<std::sync::Mutex<Option<std::process::Child>>>),
 }
 
@@ -89,7 +133,6 @@ impl ChildHandle {
     pub fn kill(self) -> Result<(), String> {
         match self {
             ChildHandle::Sidecar(c) => c.kill().map_err(|e| e.to_string()),
-            #[cfg(target_os = "macos")]
             ChildHandle::NativeShared(arc) => {
                 let mut g = arc.lock().map_err(|e| e.to_string())?;
                 if let Some(mut c) = g.take() {
@@ -119,19 +162,28 @@ impl SidecarHandle {
 
 /// Spawn `sing-box run -c <config_path> --disable-color`, return a handle.
 /// This task does NOT block until exit — caller drives readiness elsewhere.
+///
+/// `binary_override = None` → the Tauri-bundled sidecar.
+/// `binary_override = Some(path)` → that explicit binary via
+/// `std::process::Command` (used by the Dashboard's "switch sing-box
+/// version" flow).
 pub fn spawn_run(
     app: &AppHandle,
     config_path: &Path,
     elevation: ElevationMode,
+    binary_override: Option<&Path>,
 ) -> AppResult<SidecarHandle> {
     let path_str = config_path
         .to_str()
         .ok_or_else(|| AppError::Config(format!("non-UTF-8 path: {}", config_path.display())))?;
 
     match elevation {
-        ElevationMode::None => spawn_run_sidecar(app, path_str),
+        ElevationMode::None => match binary_override {
+            None => spawn_run_sidecar(app, path_str),
+            Some(bin) => spawn_run_native(bin, path_str),
+        },
         #[cfg(target_os = "macos")]
-        ElevationMode::MacosAdmin => spawn_run_macos_admin(path_str),
+        ElevationMode::MacosAdmin => spawn_run_macos_admin(binary_override, path_str),
     }
 }
 
@@ -194,19 +246,103 @@ fn spawn_run_sidecar(app: &AppHandle, path_str: &str) -> AppResult<SidecarHandle
     })
 }
 
+/// Spawn an arbitrary sing-box binary via `std::process::Command`.
+/// Used when the user picks a non-bundled version on the Dashboard.
+/// stdout / stderr are piped back into the same RingBuffer the
+/// sidecar path uses, exit detected via try_wait poll → oneshot.
+fn spawn_run_native(binary: &Path, config_path_str: &str) -> AppResult<SidecarHandle> {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(binary)
+        .args(["run", "-c", config_path_str, "--disable-color"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| AppError::Sidecar(format!("spawn {}: {}", binary.display(), e)))?;
+
+    let pid = child.id();
+    #[cfg(target_os = "windows")]
+    if let Err(e) = win_assign_to_job(pid) {
+        tracing::warn!(?e, "failed to assign sing-box pid {} to job object", pid);
+    }
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let stderr_ring = Arc::new(Mutex::new(RingBuffer::<String>::new(500)));
+    let ring_stdout = stderr_ring.clone();
+    let ring_stderr = stderr_ring.clone();
+    if let Some(out) = stdout {
+        std::thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                if !line.trim().is_empty() {
+                    ring_stdout.lock().push(line);
+                }
+            }
+        });
+    }
+    if let Some(err) = stderr {
+        std::thread::spawn(move || {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                if !line.trim().is_empty() {
+                    ring_stderr.lock().push(line);
+                }
+            }
+        });
+    }
+
+    let (exit_tx, exit_rx) = oneshot::channel::<Option<i32>>();
+    let child_arc = std::sync::Arc::new(std::sync::Mutex::new(Some(child)));
+    let child_for_watcher = child_arc.clone();
+    std::thread::spawn(move || loop {
+        let status = {
+            let mut g = child_for_watcher.lock().unwrap();
+            match g.as_mut() {
+                Some(c) => c.try_wait(),
+                None => return,
+            }
+        };
+        match status {
+            Ok(Some(s)) => {
+                let _ = exit_tx.send(s.code());
+                return;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+            Err(_) => return,
+        }
+    });
+
+    Ok(SidecarHandle {
+        child: ChildHandle::NativeShared(child_arc),
+        pid,
+        stderr_ring,
+        exit_rx: Arc::new(Mutex::new(Some(exit_rx))),
+    })
+}
+
 /// macOS-only: launch sing-box wrapped in `osascript` so it runs as
 /// root. The user sees Touch ID/password prompt before the binary
 /// starts. We do NOT use the Tauri sidecar here — `tauri-plugin-shell`
 /// can't set the AppleScript privilege wrapping. Stderr/stdout are
 /// merged and piped back; we read them on a background thread and
 /// push lines into the same ring buffer the sidecar path uses.
+///
+/// `binary_override` is the user's chosen non-bundled sing-box, if
+/// any; falls back to the bundled binary.
 #[cfg(target_os = "macos")]
-fn spawn_run_macos_admin(path_str: &str) -> AppResult<SidecarHandle> {
+fn spawn_run_macos_admin(
+    binary_override: Option<&Path>,
+    path_str: &str,
+) -> AppResult<SidecarHandle> {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
 
-    let bin = crate::commands::core_cmd::resolve_singbox_binary_path()
-        .ok_or_else(|| AppError::Sidecar("bundled sing-box binary not found".into()))?;
+    let bin = match binary_override {
+        Some(p) => p.to_path_buf(),
+        None => crate::commands::core_cmd::resolve_singbox_binary_path()
+            .ok_or_else(|| AppError::Sidecar("bundled sing-box binary not found".into()))?,
+    };
     let bin_str = bin
         .to_str()
         .ok_or_else(|| AppError::Sidecar("non-UTF-8 sing-box path".into()))?;

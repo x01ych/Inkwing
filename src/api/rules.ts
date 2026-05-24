@@ -117,6 +117,17 @@ export interface RuleSetView {
   update_interval: string | null;
   readonly_reason: string;
   raw_pretty: string;
+  /** UNIX millis from sing-box's cache.db. Null if not yet downloaded. */
+  last_updated_ms: number | null;
+  /** HTTP ETag sing-box last saw. Null when no cache entry. */
+  etag: string | null;
+}
+
+export interface RuleSetRefreshResult {
+  tag: string;
+  ok: boolean;
+  new_last_updated_ms: number | null;
+  error: string | null;
 }
 
 export interface RuleSetInput {
@@ -153,4 +164,10 @@ export const ruleSetsApi = {
     invoke<RuleSetViewWithBadge[]>('rule_sets_revert', { signatureId }),
   commit: (restart: boolean) =>
     invoke<void>('rule_sets_commit', { restart }),
+  /** Force re-download of one remote rule_set. Restarts sing-box. */
+  refresh: (tag: string) =>
+    invoke<RuleSetRefreshResult>('rule_set_refresh', { tag }),
+  /** Wipes all cached rule_sets and restarts sing-box; each remote
+   * rule_set then re-downloads on startup. */
+  refreshAll: () => invoke<RuleSetRefreshResult[]>('rule_set_refresh_all'),
 };

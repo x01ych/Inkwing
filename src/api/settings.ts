@@ -18,6 +18,8 @@ export interface Settings {
   mixed_port: number | null;
   socks_port: number | null;
   http_port: number | null;
+  /** Identifier of the user-selected sing-box binary; null = bundled. */
+  selected_singbox_version: string | null;
 }
 
 export const settingsApi = {

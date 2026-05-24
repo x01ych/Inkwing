@@ -24,8 +24,9 @@ use crate::core::rules::{
     input_to_value, rule_set_input_to_value, rule_set_to_view, rule_to_view, RuleInput,
     RuleSetInput, RuleSetView, RuleView,
 };
+use crate::core::singbox_cache;
 use crate::error::{AppError, AppResult};
-use crate::paths::{global_overrides_path, per_config_overrides_path};
+use crate::paths::{cache_file_path, global_overrides_path, per_config_overrides_path};
 use crate::state::AppState;
 
 // ---------- public DTOs -------------------------------------------------
@@ -438,11 +439,38 @@ pub async fn rule_sets_list(
 ) -> AppResult<Vec<RuleSetViewWithBadge>> {
     let (_active, per, global) = load_overrides_for_active(&app, &state)?;
     let source = source_array(&state, "/route/rule_set");
-    Ok(merge_rule_sets_for_view(
+    let mut merged = merge_rule_sets_for_view(
         &source,
         &per.route_rule_set,
         &global.route_rule_set,
-    ))
+    );
+
+    // Best-effort: enrich each row with sing-box's own last_updated /
+    // etag from cache.db. Failures are non-fatal — the UI just shows
+    // "Never" for those rows.
+    let cache_id = {
+        let g = state.config.lock();
+        singbox_cache::cache_id_for(g.parsed.as_ref())
+    };
+    if let Ok(db_path) = cache_file_path() {
+        match singbox_cache::read_rule_set_status(&db_path, &cache_id) {
+            Ok(map) if !map.is_empty() => {
+                for row in &mut merged {
+                    if let Some(st) = map.get(&row.view.tag) {
+                        if st.last_updated_ms > 0 {
+                            row.view.last_updated_ms = Some(st.last_updated_ms);
+                        }
+                        if !st.etag.is_empty() {
+                            row.view.etag = Some(st.etag.clone());
+                        }
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::debug!("singbox_cache read failed (non-fatal): {e}"),
+        }
+    }
+    Ok(merged)
 }
 
 fn merge_rule_sets_for_view(
@@ -676,5 +704,128 @@ pub async fn rule_sets_commit(
         let _ = crate::commands::core_cmd::core_start(app, state).await?;
     }
     Ok(())
+}
+
+// ---------- rule_set refresh (sing-box-native) -------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuleSetRefreshResult {
+    pub tag: String,
+    pub ok: bool,
+    pub new_last_updated_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+/// Force sing-box to re-download a single remote rule_set:
+///   1. stop the core (so cache.db unlocks)
+///   2. delete the cached entry for `tag` from cache.db
+///   3. start the core; sing-box's RemoteRuleSet.Start() sees a cache
+///      miss and synchronously fetches the URL.
+///
+/// Errors:
+///   - tag is not a remote rule_set → returns Err
+///   - the cache invalidate / start step fails → returned as part of the
+///     result so the UI can show it; we still try to restart the core.
+#[tauri::command]
+pub async fn rule_set_refresh(
+    tag: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<RuleSetRefreshResult> {
+    // Verify the tag exists and is remote.
+    let merged = rule_sets_list(app.clone(), state.clone()).await?;
+    let row = merged
+        .iter()
+        .find(|r| r.view.tag == tag)
+        .ok_or_else(|| AppError::Config(format!("no rule_set with tag '{tag}'")))?;
+    if row.view.kind != "remote" {
+        return Err(AppError::Config(format!(
+            "rule_set '{tag}' is type '{}' — only remote rule_sets can be refreshed",
+            row.view.kind
+        )));
+    }
+
+    let cache_id = {
+        let g = state.config.lock();
+        singbox_cache::cache_id_for(g.parsed.as_ref())
+    };
+    let db_path = cache_file_path()?;
+
+    // Stop core → invalidate → start core.
+    let _ = crate::commands::core_cmd::core_stop(app.clone(), state.clone()).await;
+    let mut err: Option<String> = None;
+    if let Err(e) = singbox_cache::invalidate_rule_set(&db_path, &cache_id, &tag) {
+        err = Some(format!("invalidate failed: {e}"));
+    }
+    if let Err(e) = crate::commands::core_cmd::core_start(app.clone(), state.clone()).await {
+        let msg = format!("core_start failed: {e}");
+        err = Some(err.map(|prev| format!("{prev}; {msg}")).unwrap_or(msg));
+    }
+
+    // Re-read cache.db for the new timestamp (sing-box's Start path
+    // downloads synchronously, so by this point the entry should exist).
+    let mut new_ts: Option<u64> = None;
+    if let Ok(map) = singbox_cache::read_rule_set_status(&db_path, &cache_id) {
+        new_ts = map.get(&tag).map(|s| s.last_updated_ms).filter(|t| *t > 0);
+    }
+
+    Ok(RuleSetRefreshResult {
+        tag,
+        ok: err.is_none(),
+        new_last_updated_ms: new_ts,
+        error: err,
+    })
+}
+
+/// Same as `rule_set_refresh` but wipes the whole `rule_set` sub-bucket
+/// so EVERY remote rule_set gets re-downloaded on start.
+#[tauri::command]
+pub async fn rule_set_refresh_all(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<RuleSetRefreshResult>> {
+    let merged = rule_sets_list(app.clone(), state.clone()).await?;
+    let remote_tags: Vec<String> = merged
+        .iter()
+        .filter(|r| r.view.kind == "remote")
+        .map(|r| r.view.tag.clone())
+        .collect();
+    if remote_tags.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let cache_id = {
+        let g = state.config.lock();
+        singbox_cache::cache_id_for(g.parsed.as_ref())
+    };
+    let db_path = cache_file_path()?;
+
+    let _ = crate::commands::core_cmd::core_stop(app.clone(), state.clone()).await;
+    let invalidate_err =
+        singbox_cache::invalidate_all_rule_sets(&db_path, &cache_id).err().map(|e| e.to_string());
+    let start_err = crate::commands::core_cmd::core_start(app.clone(), state.clone())
+        .await
+        .err()
+        .map(|e| e.to_string());
+
+    let map = singbox_cache::read_rule_set_status(&db_path, &cache_id).unwrap_or_default();
+    Ok(remote_tags
+        .into_iter()
+        .map(|tag| {
+            let new_ts = map.get(&tag).map(|s| s.last_updated_ms).filter(|t| *t > 0);
+            let err = match (&invalidate_err, &start_err) {
+                (Some(a), Some(b)) => Some(format!("invalidate failed: {a}; core_start failed: {b}")),
+                (Some(a), None) => Some(format!("invalidate failed: {a}")),
+                (None, Some(b)) => Some(format!("core_start failed: {b}")),
+                (None, None) => None,
+            };
+            RuleSetRefreshResult {
+                tag,
+                ok: err.is_none() && new_ts.is_some(),
+                new_last_updated_ms: new_ts,
+                error: err,
+            }
+        })
+        .collect())
 }
 

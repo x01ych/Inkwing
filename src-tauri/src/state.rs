@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::core::log_pump::LogEntry;
@@ -27,6 +28,11 @@ pub struct AppState {
     /// writer's entry. Held across the load → mutate → save → emit
     /// window.
     pub library_op: Arc<tokio::sync::Mutex<()>>,
+    /// Serialises `subscriptions.json` load/mutate/save windows.
+    /// Without this, a user editing a sub while the scheduler is mid-tick
+    /// races on the file: both load the same snapshot, both mutate
+    /// independently, the later save wins.
+    pub subs_op: Arc<tokio::sync::Mutex<()>>,
     /// Monotonically increasing counter, bumped on every successful
     /// `core_start`. Each pump stamps its emits with the current value;
     /// the frontend stores drop events whose epoch != currentEpoch. This
@@ -35,6 +41,10 @@ pub struct AppState {
     /// queue, so without this the new traffic chart can briefly show
     /// dead-session bytes).
     pub session_epoch: Arc<AtomicU64>,
+    /// Wakes the subscription scheduler when subscriptions are
+    /// added/updated/removed so it can recompute next-fire times
+    /// without waiting for its current sleep to expire.
+    pub subs_wakeup: Arc<Notify>,
 }
 
 impl Default for AppState {
@@ -45,7 +55,9 @@ impl Default for AppState {
             logs: Arc::new(Mutex::new(RingBuffer::new(2000))),
             settings_op: Arc::new(tokio::sync::Mutex::new(())),
             library_op: Arc::new(tokio::sync::Mutex::new(())),
+            subs_op: Arc::new(tokio::sync::Mutex::new(())),
             session_epoch: Arc::new(AtomicU64::new(0)),
+            subs_wakeup: Arc::new(Notify::new()),
         }
     }
 }

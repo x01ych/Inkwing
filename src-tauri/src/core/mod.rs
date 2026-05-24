@@ -1,3 +1,4 @@
+pub mod binaries;
 pub mod clash_api;
 pub mod clash_inject;
 pub mod config;
@@ -9,6 +10,8 @@ pub mod log_pump;
 pub mod overrides;
 pub mod process;
 pub mod rules;
+pub mod singbox_cache;
+pub mod subscription_scheduler;
 pub mod subscriptions;
 pub mod tray;
 pub mod traffic_pump;

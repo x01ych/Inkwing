@@ -43,6 +43,8 @@ pub fn run() {
             // Pull the persisted config library into AppState + load the
             // active config into the cache the legacy commands read.
             commands::config_cmd::hydrate_on_startup(app.handle());
+            // Background subscription scheduler (interval / daily-at).
+            core::subscription_scheduler::spawn(app.handle().clone());
             Ok(())
         })
         // Window-close interception: hide to tray when the user has
@@ -69,6 +71,11 @@ pub fn run() {
             commands::core_cmd::core_stop,
             commands::core_cmd::core_check_privilege,
             commands::core_cmd::core_restart,
+            commands::core_cmd::singbox_versions_list,
+            commands::core_cmd::singbox_versions_list_remote,
+            commands::core_cmd::singbox_versions_download,
+            commands::core_cmd::singbox_versions_delete,
+            commands::core_cmd::singbox_versions_select,
             commands::core_cmd::logs_recent,
             #[cfg(target_os = "linux")]
             commands::core_cmd::core_grant_tun_capability_linux,
@@ -117,6 +124,8 @@ pub fn run() {
             commands::rules_cmd::rule_sets_unmask,
             commands::rules_cmd::rule_sets_revert,
             commands::rules_cmd::rule_sets_commit,
+            commands::rules_cmd::rule_set_refresh,
+            commands::rules_cmd::rule_set_refresh_all,
             commands::dns_cmd::dns_servers_list,
             commands::dns_cmd::dns_servers_add,
             commands::dns_cmd::dns_servers_update,

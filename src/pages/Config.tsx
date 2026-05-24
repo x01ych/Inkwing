@@ -250,22 +250,29 @@ export default function ConfigPage() {
         </div>
       ) : (
         <div className="grid gap-3 [grid-template-columns:repeat(auto-fill,minmax(280px,1fr))]">
-          {library.map((row) => (
-            <ConfigCard
-              key={row.id}
-              row={row}
-              busy={busyId === row.id}
-              onSelect={() => handleSelect(row)}
-              onRename={() => handleRenameOpen(row)}
-              onEditSub={() => handleEditSubscription(row)}
-              onReveal={() =>
-                configApi.libraryReveal(row.id).catch((e) => toast.error(String(e)))
-              }
-              onView={() => navigate(`/config/${row.id}`)}
-              onRefresh={() => handleRefreshSubscriptionEntry(row)}
-              onDelete={() => setDeleteTarget(row)}
-            />
-          ))}
+          {library.map((row) => {
+            const sub =
+              row.source.kind === 'subscription'
+                ? (subs.find((s) => s.id === (row.source as { sub_id: string }).sub_id) ?? null)
+                : null;
+            return (
+              <ConfigCard
+                key={row.id}
+                row={row}
+                subscription={sub}
+                busy={busyId === row.id}
+                onSelect={() => handleSelect(row)}
+                onRename={() => handleRenameOpen(row)}
+                onEditSub={() => handleEditSubscription(row)}
+                onReveal={() =>
+                  configApi.libraryReveal(row.id).catch((e) => toast.error(String(e)))
+                }
+                onView={() => navigate(`/config/${row.id}`)}
+                onRefresh={() => handleRefreshSubscriptionEntry(row)}
+                onDelete={() => setDeleteTarget(row)}
+              />
+            );
+          })}
         </div>
       )}
 
@@ -347,6 +354,7 @@ export default function ConfigPage() {
 
 function ConfigCard({
   row,
+  subscription,
   busy,
   onSelect,
   onRename,
@@ -357,6 +365,7 @@ function ConfigCard({
   onDelete,
 }: {
   row: ConfigEntrySummary;
+  subscription: Subscription | null;
   busy: boolean;
   onSelect: () => void;
   onRename: () => void;
@@ -367,6 +376,7 @@ function ConfigCard({
   onDelete: () => void;
 }) {
   const isSub = row.source.kind === 'subscription';
+  const nextUpdate = subscription ? computeNextUpdate(subscription) : null;
 
   // Items shared by both menus (right-click ContextMenu and ⋯ DropdownMenu).
   // Each entry is keyed and renders into the matching primitive below.
@@ -500,6 +510,16 @@ function ConfigCard({
           <div className="text-[11px] text-muted-foreground">
             updated {dayjs(row.updated_at_ms).format('MM-DD HH:mm')}
           </div>
+          {nextUpdate && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <div className="text-[11px] text-muted-foreground">
+                  next auto-update {nextUpdate.relative}
+                </div>
+              </TooltipTrigger>
+              <TooltipContent>{nextUpdate.absolute}</TooltipContent>
+            </Tooltip>
+          )}
 
           <div className="mt-auto flex justify-end gap-2">
             {isSub && (
@@ -540,4 +560,40 @@ function ConfigCard({
       {ContextItems}
     </ContextMenu>
   );
+}
+
+/**
+ * When will this subscription next auto-update?
+ * Mirrors the Rust scheduler's next_fire_at: daily_update_at wins over
+ * interval_hours; missing both → manual only, return null.
+ */
+function computeNextUpdate(
+  s: Subscription
+): { relative: string; absolute: string } | null {
+  const now = Date.now();
+  let fire: number | null = null;
+  if (s.daily_update_at && /^\d{2}:\d{2}$/.test(s.daily_update_at)) {
+    const [hh, mm] = s.daily_update_at.split(':').map((p) => parseInt(p, 10));
+    const today = new Date();
+    today.setHours(hh, mm, 0, 0);
+    fire = today.getTime() <= now ? today.getTime() + 24 * 3600 * 1000 : today.getTime();
+  } else if (s.interval_hours > 0) {
+    fire = (s.last_fetched_at_ms ?? now) + s.interval_hours * 3600 * 1000;
+    if (fire < now) fire = now;
+  }
+  if (fire === null) return null;
+  return {
+    relative: formatRelative(fire - now),
+    absolute: dayjs(fire).format('YYYY-MM-DD HH:mm:ss'),
+  };
+}
+
+function formatRelative(deltaMs: number): string {
+  if (deltaMs <= 0) return 'now';
+  const min = Math.round(deltaMs / 60000);
+  if (min < 60) return `in ${min} min`;
+  const hr = Math.round(min / 60);
+  if (hr < 24) return `in ${hr} h`;
+  const d = Math.round(hr / 24);
+  return `in ${d} d`;
 }

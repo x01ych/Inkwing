@@ -20,8 +20,8 @@ use tauri_plugin_store::StoreExt;
 
 use crate::error::{AppError, AppResult};
 
-const STORE_FILE: &str = "settings.json";
-const SETTINGS_KEY: &str = "settings";
+pub(crate) const STORE_FILE: &str = "settings.json";
+pub(crate) const SETTINGS_KEY: &str = "settings";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -61,6 +61,12 @@ pub struct Settings {
     pub socks_port: Option<u16>,
     #[serde(default)]
     pub http_port: Option<u16>,
+    /// Identifier of the currently-selected sing-box binary. None →
+    /// use the bundled sidecar; Some("v1.10.7") → look up under
+    /// `data_dir/binaries/v1.10.7/sing-box[.exe]`. The Dashboard
+    /// version-picker writes this; `core_start` reads it.
+    #[serde(default)]
+    pub selected_singbox_version: Option<String>,
 }
 
 fn default_proxy_mode() -> String {
@@ -85,6 +91,7 @@ impl Default for Settings {
             mixed_port: Some(7890),
             socks_port: None,
             http_port: None,
+            selected_singbox_version: None,
         }
     }
 }
@@ -187,6 +194,12 @@ pub async fn settings_set(
         }
         if obj.contains_key("http_port") {
             current.http_port = obj.get("http_port").and_then(|v| v.as_u64()).and_then(|n| u16::try_from(n).ok());
+        }
+        if obj.contains_key("selected_singbox_version") {
+            current.selected_singbox_version = obj
+                .get("selected_singbox_version")
+                .and_then(|v| v.as_str())
+                .map(String::from);
         }
     }
     // Backend guard: tun_enabled flipping ON without privileges should

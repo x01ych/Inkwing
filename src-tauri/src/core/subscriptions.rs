@@ -25,12 +25,43 @@ pub struct Subscription {
     pub id: String,
     pub name: String,
     pub url: String,
-    /// 0 = manual refresh only.
+    /// 0 = no every-N-hours mode. When `daily_update_at` is Some, this
+    /// field is ignored.
     pub interval_hours: u32,
+    /// "HH:MM" 24-hour local time. When Some, the scheduler ignores
+    /// `interval_hours` and fires once per day at this wall-clock time.
+    /// Useful for picking off-hours to avoid the brief disconnect that
+    /// auto-switch causes.
+    #[serde(default)]
+    pub daily_update_at: Option<String>,
     pub last_fetched_at_ms: Option<u64>,
     pub last_error: Option<String>,
     /// Cached outbound count from the most recent successful fetch.
     pub outbound_count: Option<u32>,
+    /// After a successful scheduled apply, keep the most recent N library
+    /// entries from this subscription and delete the rest (excluding the
+    /// currently active one). None → default 5.
+    #[serde(default)]
+    pub keep_last_n: Option<u32>,
+    /// When true (default), a scheduled apply that lands while the
+    /// currently active config came from this subscription will switch
+    /// active → the new entry and restart sing-box. When false, the new
+    /// entry just sits on the shelf.
+    #[serde(default = "default_auto_switch")]
+    pub auto_switch_to_new: bool,
+    /// Count of consecutive scheduled-apply failures. Used to throttle
+    /// system notifications: only emit when crossing from <3 to ≥3.
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    /// Wall-clock ms of the most recent scheduled attempt (success OR
+    /// failure). Used by the scheduler's exponential-backoff logic so a
+    /// failing endpoint stops getting retried every MIN_SLEEP.
+    #[serde(default)]
+    pub last_attempt_at_ms: Option<u64>,
+}
+
+fn default_auto_switch() -> bool {
+    true
 }
 
 pub fn load_all(app: &AppHandle<Wry>) -> Vec<Subscription> {
@@ -60,9 +91,14 @@ pub fn new_subscription(name: String, url: String, interval_hours: u32) -> Subsc
         name,
         url,
         interval_hours,
+        daily_update_at: None,
         last_fetched_at_ms: None,
         last_error: None,
         outbound_count: None,
+        keep_last_n: None,
+        auto_switch_to_new: true,
+        consecutive_failures: 0,
+        last_attempt_at_ms: None,
     }
 }
 

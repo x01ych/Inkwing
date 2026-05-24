@@ -20,15 +20,44 @@ pub struct ValidationError {
     pub message: String,
 }
 
-/// Run `sing-box check -c <path> --disable-color` via the sidecar. Exit 0 =>
-/// ok=true, errors=[]. Non-zero => parse stderr lines into structured
-/// errors. Stripped of ANSI color codes for safety in case --disable-color
-/// is ignored on some build.
+/// Run `sing-box check -c <path> --disable-color` via the bundled
+/// sidecar. Exit 0 ⇒ ok=true, errors=[]. Non-zero ⇒ parse stderr lines
+/// into structured errors. ANSI color codes are stripped so the output
+/// is safe to surface in the UI.
 pub async fn validate_path(app: &AppHandle, path: &Path) -> AppResult<ValidationReport> {
+    validate_with_binary(app, None, path).await
+}
+
+/// Same as `validate_path` but supports running an explicit non-bundled
+/// sing-box binary (the user-selected version). When `binary_opt` is
+/// None, falls back to the Tauri-bundled sidecar.
+pub async fn validate_with_binary(
+    app: &AppHandle,
+    binary_opt: Option<&Path>,
+    path: &Path,
+) -> AppResult<ValidationReport> {
     let path_str = path
         .to_str()
         .ok_or_else(|| AppError::Config(format!("non-UTF-8 path: {}", path.display())))?;
 
+    let (exit_code, stderr_lines) = match binary_opt {
+        None => run_via_sidecar(app, path_str).await?,
+        Some(bin) => run_via_binary(bin, path_str).await?,
+    };
+
+    let ok = matches!(exit_code, Some(0));
+    let errors = if ok {
+        Vec::new()
+    } else {
+        stderr_lines.into_iter().map(parse_log_line).collect()
+    };
+    Ok(ValidationReport { ok, exit_code, errors })
+}
+
+async fn run_via_sidecar(
+    app: &AppHandle,
+    path_str: &str,
+) -> AppResult<(Option<i32>, Vec<String>)> {
     let cmd = app
         .shell()
         .sidecar("sing-box")
@@ -41,7 +70,6 @@ pub async fn validate_path(app: &AppHandle, path: &Path) -> AppResult<Validation
 
     let mut stderr_lines: Vec<String> = Vec::new();
     let mut exit_code: Option<i32> = None;
-
     while let Some(ev) = rx.recv().await {
         match ev {
             CommandEvent::Stderr(line) => {
@@ -55,17 +83,45 @@ pub async fn validate_path(app: &AppHandle, path: &Path) -> AppResult<Validation
             _ => {}
         }
     }
+    Ok((exit_code, stderr_lines))
+}
 
-    let ok = matches!(exit_code, Some(0));
-    let errors = if ok {
-        Vec::new()
+async fn run_via_binary(
+    binary: &Path,
+    path_str: &str,
+) -> AppResult<(Option<i32>, Vec<String>)> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut child = tokio::process::Command::new(binary)
+        .args(["check", "-c", path_str, "--disable-color"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| AppError::Sidecar(format!("spawn {}: {}", binary.display(), e)))?;
+
+    let stderr_lines = if let Some(err) = child.stderr.take() {
+        let mut lines = Vec::new();
+        let mut r = BufReader::new(err).lines();
+        while let Ok(Some(line)) = r.next_line().await {
+            let s = strip_ansi(&line);
+            if !s.trim().is_empty() {
+                lines.push(s);
+            }
+        }
+        lines
     } else {
-        stderr_lines
-            .into_iter()
-            .map(parse_log_line)
-            .collect()
+        Vec::new()
     };
-    Ok(ValidationReport { ok, exit_code, errors })
+    // Drain stdout so the child can exit cleanly.
+    if let Some(out) = child.stdout.take() {
+        let mut r = BufReader::new(out).lines();
+        while let Ok(Some(_)) = r.next_line().await {}
+    }
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| AppError::Sidecar(format!("wait {}: {}", binary.display(), e)))?;
+    Ok((status.code(), stderr_lines))
 }
 
 fn parse_log_line(line: String) -> ValidationError {

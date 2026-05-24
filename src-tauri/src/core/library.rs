@@ -135,3 +135,58 @@ pub fn write_initial(path: &PathBuf, bytes: &[u8]) -> AppResult<()> {
     }
     crate::util::atomic_write::atomic_write(path, bytes)
 }
+
+/// Keep the most-recent `keep` entries originating from `sub_id` and
+/// delete the rest. Active entry is always retained even if it's not
+/// among the newest `keep` (we never delete what the user is running).
+///
+/// Returns the ids of deleted entries (so callers can also `state.config
+/// .lock().library = lib.entries.clone()` if needed). On-disk storage
+/// files are unlinked too.
+pub fn prune_subscription_entries(
+    app: &AppHandle<Wry>,
+    sub_id: &str,
+    keep: u32,
+) -> AppResult<Vec<String>> {
+    let keep = keep.max(1) as usize;
+    let mut lib = load(app);
+    // Indices of entries originating from this subscription.
+    let mut indexed: Vec<(usize, u64, bool)> = lib
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| match &e.source {
+            ConfigSource::Subscription { sub_id: s, fetched_at_ms } if s == sub_id => {
+                let is_active = lib.active_id.as_deref() == Some(e.id.as_str());
+                Some((i, *fetched_at_ms, is_active))
+            }
+            _ => None,
+        })
+        .collect();
+    // Newest first.
+    indexed.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut kept = 0usize;
+    let mut to_delete: Vec<usize> = Vec::new();
+    for (idx, _, is_active) in indexed {
+        if is_active || kept < keep {
+            if !is_active {
+                kept += 1;
+            }
+            continue;
+        }
+        to_delete.push(idx);
+    }
+    if to_delete.is_empty() {
+        return Ok(vec![]);
+    }
+    // Delete by descending index so earlier indices stay valid.
+    to_delete.sort_unstable_by(|a, b| b.cmp(a));
+    let mut deleted_ids = Vec::with_capacity(to_delete.len());
+    for idx in to_delete {
+        let entry = lib.entries.remove(idx);
+        let _ = std::fs::remove_file(&entry.storage_path);
+        deleted_ids.push(entry.id);
+    }
+    save(app, &lib)?;
+    Ok(deleted_ids)
+}

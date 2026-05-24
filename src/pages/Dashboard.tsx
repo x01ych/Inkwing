@@ -1,8 +1,22 @@
-import { Loader2, RefreshCcw, ShieldCheck } from 'lucide-react';
+import { Download, Loader2, RefreshCcw, ShieldCheck, Trash2 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Area, AreaChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { Link } from 'react-router-dom';
-import { coreApi, type PrivilegeReport } from '../api/core';
+import { toast } from 'sonner';
+import {
+  coreApi,
+  singboxVersionsApi,
+  type InstalledBinary,
+  type PrivilegeReport,
+} from '../api/core';
+import SingboxVersionDialog from '../components/dialogs/SingboxVersionDialog';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '../components/ui/select';
 import { onCoreState, onPumpStale, onTraffic } from '../api/events';
 import { useEventListener } from '../api/useEventListener';
 import { useConfigStore } from '../store/configStore';
@@ -34,6 +48,13 @@ export default function Dashboard() {
   const [crash, setCrash] = useState<{ code: number | null; at: number } | null>(null);
   const [stalePumps, setStalePumps] = useState<Set<string>>(new Set());
 
+  // Version selector state.
+  const [installed, setInstalled] = useState<InstalledBinary[]>([]);
+  const [selectedVersion, setSelectedVersion] = useState<string>('bundled');
+  const [applyingVersion, setApplyingVersion] = useState(false);
+  const [versionDialogOpen, setVersionDialogOpen] = useState(false);
+  const [versionError, setVersionError] = useState<string[]>([]);
+
   useEventListener(() => onTraffic((t) => pushTraffic(t)));
   useEventListener(() =>
     onCoreState((s) => {
@@ -56,12 +77,27 @@ export default function Dashboard() {
     )
   );
 
+  async function loadInstalled() {
+    try {
+      const list = await singboxVersionsApi.list();
+      setInstalled(list);
+    } catch {
+      setInstalled([]);
+    }
+  }
+
   useEffect(() => {
     coreApi.status().then(setStatus).catch(() => {});
     coreApi.checkPrivilege().then(setPrivilege).catch(() => {});
     coreApi.version().then(setVersion).catch(() => setVersion(''));
+    loadInstalled();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Keep the dropdown in sync with whatever's persisted in settings.
+  useEffect(() => {
+    setSelectedVersion(settings?.selected_singbox_version ?? 'bundled');
+  }, [settings?.selected_singbox_version]);
 
   const running = !!status?.running;
   const last = traffic[traffic.length - 1];
@@ -81,6 +117,50 @@ export default function Dashboard() {
       setStatus(s);
     } finally {
       setRestarting(false);
+    }
+  }
+
+  async function handleApplyVersion() {
+    setApplyingVersion(true);
+    setVersionError([]);
+    try {
+      const report = await singboxVersionsApi.select(selectedVersion);
+      if (!report.ok) {
+        setVersionError(
+          report.errors.length > 0
+            ? report.errors.map((e) => `${e.level}: ${e.message}`)
+            : [`sing-box check failed (exit ${report.exit_code ?? '?'})`]
+        );
+        return;
+      }
+      toast.success(
+        `Switched to ${selectedVersion === 'bundled' ? 'bundled' : selectedVersion} — core restarted`
+      );
+      const [s, v] = await Promise.all([coreApi.status(), coreApi.version()]);
+      setStatus(s);
+      setVersion(v);
+    } catch (e) {
+      const msg = String((e as Error)?.message ?? e);
+      setVersionError([msg]);
+      toast.error(msg);
+    } finally {
+      setApplyingVersion(false);
+    }
+  }
+
+  async function handleDeleteVersion() {
+    if (selectedVersion === 'bundled') return;
+    if (selectedVersion === (settings?.selected_singbox_version ?? 'bundled')) {
+      toast.error('Cannot delete the currently active version. Apply bundled first.');
+      return;
+    }
+    try {
+      await singboxVersionsApi.delete(selectedVersion);
+      toast.success(`Removed ${selectedVersion}`);
+      await loadInstalled();
+      setSelectedVersion(settings?.selected_singbox_version ?? 'bundled');
+    } catch (e) {
+      toast.error(String((e as Error)?.message ?? e));
     }
   }
 
@@ -248,15 +328,87 @@ export default function Dashboard() {
       </Card>
 
       <Card>
-        <CardHeader>
-          <CardTitle className="text-base">sing-box binary</CardTitle>
+        <CardHeader className="flex flex-row items-center justify-between space-y-0">
+          <CardTitle className="text-base">sing-box version</CardTitle>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setVersionDialogOpen(true)}
+          >
+            <Download className="h-4 w-4" />
+            Download new
+          </Button>
         </CardHeader>
-        <CardContent>
-          <pre className="overflow-x-auto rounded-md border border-border bg-muted px-3 py-2 text-xs">
-            {version || 'probing…'}
-          </pre>
+        <CardContent className="space-y-4">
+          <div className="flex flex-wrap items-center gap-2">
+            <Select value={selectedVersion} onValueChange={setSelectedVersion}>
+              <SelectTrigger className="w-64">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {installed.map((b) => (
+                  <SelectItem key={b.version} value={b.version}>
+                    {b.version}
+                    {b.is_bundled ? ' (bundled)' : ''}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Button
+              size="sm"
+              onClick={handleApplyVersion}
+              disabled={
+                applyingVersion ||
+                selectedVersion === (settings?.selected_singbox_version ?? 'bundled')
+              }
+            >
+              {applyingVersion ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : null}
+              Apply
+            </Button>
+            {selectedVersion !== 'bundled' && (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="text-destructive hover:text-destructive"
+                disabled={
+                  applyingVersion ||
+                  selectedVersion === (settings?.selected_singbox_version ?? 'bundled')
+                }
+                onClick={handleDeleteVersion}
+              >
+                <Trash2 className="h-4 w-4" />
+                Delete
+              </Button>
+            )}
+          </div>
+
+          {versionError.length > 0 && (
+            <Alert variant="destructive">
+              <AlertTitle>Validation failed — core not switched</AlertTitle>
+              <AlertDescription>
+                <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap text-xs">
+                  {versionError.join('\n')}
+                </pre>
+              </AlertDescription>
+            </Alert>
+          )}
+
+          <div>
+            <div className="mb-1 text-xs text-muted-foreground">running binary reports</div>
+            <pre className="overflow-x-auto rounded-md border border-border bg-muted px-3 py-2 text-xs">
+              {version || 'probing…'}
+            </pre>
+          </div>
         </CardContent>
       </Card>
+
+      <SingboxVersionDialog
+        open={versionDialogOpen}
+        onClose={() => setVersionDialogOpen(false)}
+        onDownloaded={loadInstalled}
+      />
     </div>
   );
 }
