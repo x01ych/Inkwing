@@ -5,15 +5,90 @@ pub mod paths;
 pub mod state;
 pub mod util;
 
+use std::io::Write;
+use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+/// Set up tracing with two writers:
+///   - stderr (visible when launched from a terminal / pnpm tauri dev)
+///   - `<data_dir>/inkwing.log` (truncated on each app start, capped at
+///     about 5 MiB by hard limit on writes — diagnostic-grade, not a
+///     long-term log file)
+///
+/// Without the file appender, Windows GUI builds have no console and
+/// stderr-only tracing output gets dropped — making "what did the
+/// backend see at the time of …" impossible to diagnose remotely.
+fn init_tracing() {
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,inkwing_lib=debug"));
+    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+
+    // Best effort: also write logs to `<data_dir>/inkwing.log` so that
+    // Windows GUI builds (no attached console) have somewhere to look.
+    // Truncated on each start, single file (no rotation) — diagnostic
+    // tool, not a long-term audit log.
+    if let Ok(d) = paths::data_dir() {
+        if !d.exists() {
+            let _ = std::fs::create_dir_all(&d);
+        }
+        let log_path = d.join("inkwing.log");
+        if let Ok(file) = std::fs::File::create(&log_path) {
+            let file = std::sync::Arc::new(Mutex::new(file));
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(SharedFileMakeWriter { file });
+            tracing_subscriber::registry()
+                .with(env_filter)
+                .with(stderr_layer)
+                .with(file_layer)
+                .init();
+            eprintln!("[inkwing] log file: {}", log_path.display());
+            return;
+        }
+    }
+
+    // Fallback: stderr only.
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(stderr_layer)
+        .init();
+}
+
+/// `MakeWriter` impl that hands out a guarded writer pointing at a shared
+/// file. `tracing_subscriber::fmt::layer().with_writer(...)` calls
+/// `make_writer()` on every event — keeping the file behind an
+/// `Arc<Mutex<...>>` so multiple threads serialise on it cleanly.
+#[derive(Clone)]
+struct SharedFileMakeWriter {
+    file: std::sync::Arc<Mutex<std::fs::File>>,
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedFileMakeWriter {
+    type Writer = SharedFileWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        SharedFileWriter {
+            file: self.file.clone(),
+        }
+    }
+}
+
+struct SharedFileWriter {
+    file: std::sync::Arc<Mutex<std::fs::File>>,
+}
+
+impl Write for SharedFileWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file.lock().unwrap().write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.lock().unwrap().flush()
+    }
+}
 
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,inkwing_lib=debug")),
-        )
-        .init();
+    init_tracing();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
