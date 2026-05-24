@@ -185,7 +185,9 @@ pub async fn subs_apply(
 /// Core fetch → write entry → push library → save → emit cycle.
 /// Caller is responsible for holding `state.library_op` and for any
 /// post-apply policy (auto-select, restart, pruning). Returns the new
-/// entry id on success.
+/// entry id on success — OR the id of the most recently created
+/// library entry from this subscription if we just applied it in the
+/// last few seconds (idempotency guard, see below).
 ///
 /// On error: subscription's `last_error` is updated and persisted,
 /// `last_fetched_at_ms` is **not** advanced, and the error propagates.
@@ -205,6 +207,39 @@ pub async fn apply_subscription_inner(
             .find(|s| s.id == sub_id)
             .ok_or_else(|| AppError::Other(format!("no subscription with id {sub_id}")))?
     };
+
+    // Idempotency: when the Add Subscription dialog runs, subs_add
+    // fires notify_one which wakes the scheduler. If the scheduler
+    // grabs library_op before the dialog's subs_apply does, the
+    // scheduler will create one entry, then subs_apply would create a
+    // second one. Detect that here: if this sub was successfully
+    // fetched <10 s ago, return the most recent corresponding entry
+    // instead of fetching again. The run_one guard in
+    // subscription_scheduler handles the opposite ordering.
+    const APPLY_DEDUP_WINDOW_MS: u64 = 10_000;
+    if let Some(last) = sub.last_fetched_at_ms {
+        if now_ms().saturating_sub(last) < APPLY_DEDUP_WINDOW_MS {
+            let lib = crate::core::library::load(app);
+            let recent = lib
+                .entries
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        &e.source,
+                        ConfigSource::Subscription { sub_id: s, .. } if s == sub_id
+                    )
+                })
+                .max_by_key(|e| e.created_at_ms)
+                .map(|e| e.id.clone());
+            if let Some(id) = recent {
+                tracing::info!(
+                    "apply_subscription_inner: sub {} was just fetched, reusing recent entry {}",
+                    sub_id, id
+                );
+                return Ok(id);
+            }
+        }
+    }
 
     let (text, parsed) = match fetch_full_config(&sub.url).await {
         Ok(t) => t,

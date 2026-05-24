@@ -208,14 +208,28 @@ async fn run_one(app: &AppHandle, sub_id: &str) {
     // Serialise against manual library mutations.
     let _lib_guard = state.library_op.lock().await;
 
-    // Read prior failure count + display name once. We don't take subs_op
-    // here — apply_subscription_inner takes it for the writes.
+    // Race guard: between collect_due() picking this sub and us taking
+    // library_op, a concurrent path (subs_apply called from the Add
+    // dialog, or another scheduler tick) may have already fetched.
+    // Re-read the sub under the lock and skip if it's no longer due.
+    // Without this, "Add subscription" would produce two identical
+    // library entries: one from subs_apply, one from the scheduler
+    // that subs_add's notify_one() kicks off.
     let (prev_failures, sub_name) = {
+        let now = now_ms();
         let all = load_all(app);
-        all.iter()
-            .find(|s| s.id == sub_id)
-            .map(|s| (s.consecutive_failures, s.name.clone()))
-            .unwrap_or((0, sub_id.to_string()))
+        let Some(s) = all.iter().find(|s| s.id == sub_id) else {
+            return;
+        };
+        let still_due = next_fire_at(s, now).map(|t| t <= now).unwrap_or(false);
+        if !still_due {
+            tracing::debug!(
+                "subscription_scheduler: sub {} no longer due (someone else fetched it first), skipping",
+                sub_id
+            );
+            return;
+        }
+        (s.consecutive_failures, s.name.clone())
     };
 
     let apply_result = apply_subscription_inner(app, &state, sub_id).await;
