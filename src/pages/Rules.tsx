@@ -592,6 +592,7 @@ function RuleSetsTab() {
   const [refreshingTags, setRefreshingTags] = useState<Set<string>>(new Set());
   const [refreshingAll, setRefreshingAll] = useState(false);
   const [probe, setProbe] = useState<RouteProbeReport | null>(null);
+  const [probeErr, setProbeErr] = useState<string | null>(null);
 
   async function refresh() {
     setLoadErr('');
@@ -604,11 +605,14 @@ function RuleSetsTab() {
       if (rows.length === 0) {
         try {
           setProbe(await ruleSetsApi.probe());
-        } catch {
+          setProbeErr(null);
+        } catch (e) {
           setProbe(null);
+          setProbeErr(String((e as Error)?.message ?? e));
         }
       } else {
         setProbe(null);
+        setProbeErr(null);
       }
     } catch (e) {
       setLoadErr(String((e as Error)?.message ?? e));
@@ -814,6 +818,7 @@ function RuleSetsTab() {
                 <TableCell colSpan={7} className="py-6">
                   <RuleSetsEmptyState
                     probe={probe}
+                    probeErr={probeErr}
                     configPath={summary.path}
                     onReload={async () => {
                       try {
@@ -1071,18 +1076,30 @@ function formatRelativeAgo(ts: number): string {
  */
 function RuleSetsEmptyState({
   probe,
+  probeErr,
   configPath,
   onReload,
 }: {
   probe: RouteProbeReport | null;
+  probeErr: string | null;
   configPath: string;
   onReload: () => void | Promise<void>;
 }) {
   const cause: { headline: string; hint: React.ReactNode } = (() => {
     if (!probe) {
       return {
-        headline: 'No rule_set entries.',
-        hint: (
+        headline: probeErr
+          ? 'Probe failed — could not inspect the active config.'
+          : 'No rule_set entries.',
+        hint: probeErr ? (
+          <>
+            The <code className="text-xs">rule_sets_probe</code> IPC threw. This usually
+            means your running .exe is older than the source tree (the probe command was
+            added in a recent commit). Rebuild with <code className="text-xs">cargo build --release</code> + <code className="text-xs">pnpm build</code>, then relaunch.
+            <br />
+            <span className="text-destructive">Error: {probeErr}</span>
+          </>
+        ) : (
           <>
             sing-box rule_sets live at <code className="text-xs">route.rule_set</code> in your
             config (plural array, sibling of <code className="text-xs">route.rules</code>).
