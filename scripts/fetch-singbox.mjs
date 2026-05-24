@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createWriteStream, existsSync, readFileSync, statSync } from 'node:fs';
-import { chmod, copyFile, mkdir, readdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { dirname, join, resolve } from 'node:path';
@@ -82,13 +82,55 @@ async function ensureDir(p) {
 }
 
 async function download(url, dest) {
+  // Atomic write: stream to <dest>.partial, then rename. A killed
+  // process / network drop leaves the .partial behind (which we
+  // happily overwrite next run) instead of poisoning the cache with
+  // a truncated archive masquerading as a complete one.
   log('GET', url);
+  const tmp = `${dest}.partial`;
+  // Best-effort cleanup of any leftover .partial from a prior failure.
+  if (existsSync(tmp)) await rm(tmp, { force: true });
   const res = await fetch(url, { redirect: 'follow' });
   if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
-  await pipeline(Readable.fromWeb(res.body), createWriteStream(dest));
+  await pipeline(Readable.fromWeb(res.body), createWriteStream(tmp));
+  await rename(tmp, dest);
   const size = statSync(dest).size;
   log(`  -> ${dest} (${(size / 1024 / 1024).toFixed(2)} MiB)`);
   return dest;
+}
+
+/** Best-effort integrity probe — list the archive without extracting.
+ * Returns true if listing succeeds, false otherwise. Callers use this
+ * to detect cache files that were left truncated by an old run of the
+ * script (before atomic download was added). */
+async function verifyArchive(archivePath, isZip) {
+  const candidates = isZip
+    ? isWindows
+      ? [
+          { cmd: 'tar', args: ['-tf', archivePath] },
+          {
+            cmd: 'powershell.exe',
+            args: [
+              '-NoProfile',
+              '-ExecutionPolicy',
+              'Bypass',
+              '-Command',
+              '& { param($p) [System.IO.Compression.ZipFile]::OpenRead($p).Dispose() }',
+              archivePath,
+            ],
+          },
+        ]
+      : [{ cmd: 'unzip', args: ['-tq', archivePath] }]
+    : [{ cmd: 'tar', args: ['-tzf', archivePath] }];
+  for (const c of candidates) {
+    try {
+      await run(c.cmd, c.args, { stdio: 'ignore' });
+      return true;
+    } catch {
+      // try the next candidate
+    }
+  }
+  return false;
 }
 
 function sha256(path) {
@@ -187,10 +229,16 @@ async function fetchSingBox(filter) {
   for (const t of targets) {
     const url = `https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/${t.archive}`;
     const archivePath = join(cacheDir, t.archive);
-    if (!existsSync(archivePath)) {
-      await download(url, archivePath);
-    } else {
+    if (existsSync(archivePath)) {
       log(`cache hit: ${t.archive}`);
+      const ok = await verifyArchive(archivePath, t.isZip);
+      if (!ok) {
+        log(`  cache corrupt (failed integrity probe) — re-downloading`);
+        await rm(archivePath, { force: true });
+        await download(url, archivePath);
+      }
+    } else {
+      await download(url, archivePath);
     }
     const digest = sha256(archivePath);
     log(`  sha256: ${digest}`);
@@ -212,10 +260,16 @@ async function fetchSingBox(filter) {
 async function fetchWintun() {
   await ensureDir(cacheDir);
   const archivePath = join(cacheDir, `wintun-${WINTUN_VERSION}.zip`);
-  if (!existsSync(archivePath)) {
-    await download(WINTUN.url, archivePath);
-  } else {
+  if (existsSync(archivePath)) {
     log(`cache hit: wintun-${WINTUN_VERSION}.zip`);
+    const ok = await verifyArchive(archivePath, true);
+    if (!ok) {
+      log(`  cache corrupt (failed integrity probe) — re-downloading`);
+      await rm(archivePath, { force: true });
+      await download(WINTUN.url, archivePath);
+    }
+  } else {
+    await download(WINTUN.url, archivePath);
   }
   const digest = sha256(archivePath);
   log(`  sha256: ${digest}`);
