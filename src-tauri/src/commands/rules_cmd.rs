@@ -592,6 +592,11 @@ pub async fn rule_sets_list(
             Err(e) => tracing::debug!("singbox_cache read failed (non-fatal): {e}"),
         }
     }
+    tracing::info!(
+        returning = merged.len(),
+        first_tag = merged.first().map(|r| r.view.tag.as_str()).unwrap_or(""),
+        "rule_sets_list returning"
+    );
     Ok(merged)
 }
 
