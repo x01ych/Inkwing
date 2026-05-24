@@ -76,9 +76,13 @@ export const singboxVersionsApi = {
   download: (version: string, assetUrl: string) =>
     invoke<InstalledBinary>('singbox_versions_download', { version, assetUrl }),
   delete: (version: string) => invoke<void>('singbox_versions_delete', { version }),
-  /** Validate the merged runtime config against the candidate binary;
-   *  if it passes, persist + restart the core under that version. The
-   *  returned report's `ok=false` means the switch did NOT happen. */
+  /** Dry-run `sing-box check` against the merged runtime config using
+   *  the candidate version, WITHOUT persisting or restarting. The UI's
+   *  "Validate" button calls this. */
+  validate: (version: string) =>
+    invoke<ValidationReport>('singbox_versions_validate', { version }),
+  /** Validate AND persist+restart under the candidate version. Returned
+   *  report.ok=false means the switch did NOT happen. */
   select: (version: string) =>
     invoke<ValidationReport>('singbox_versions_select', { version }),
 };

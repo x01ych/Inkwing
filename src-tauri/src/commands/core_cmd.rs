@@ -429,12 +429,75 @@ pub async fn singbox_versions_delete(version: String) -> AppResult<()> {
     crate::core::binaries::delete(&version)
 }
 
+/// Resolve the on-disk path of a versioned binary, or `None` for the
+/// bundled sidecar. Errors if the version dir exists but has no
+/// extracted binary inside.
+fn resolve_versioned_binary_path(version: &str) -> AppResult<Option<std::path::PathBuf>> {
+    if version == "bundled" || version.is_empty() {
+        return Ok(None);
+    }
+    let dir = crate::core::binaries::version_dir(version)?;
+    let p = dir.join(if cfg!(target_os = "windows") {
+        "sing-box.exe"
+    } else {
+        "sing-box"
+    });
+    if !p.is_file() {
+        return Err(AppError::Other(format!(
+            "version '{version}' is not installed (no binary at {})",
+            p.display()
+        )));
+    }
+    Ok(Some(p))
+}
+
+/// Compose the merged runtime config that WOULD be used if we switched
+/// to `version`, write it to a scratch path, and run `<binary> check -c`
+/// against it. Does NOT persist the selection or touch the live core —
+/// purely a dry-run for the UI's "Validate" button.
+#[tauri::command]
+pub async fn singbox_versions_validate(
+    version: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<crate::core::validate::ValidationReport> {
+    // Hold the settings lock so compose sees a consistent view, but we
+    // never write under it.
+    let _guard = state.settings_op.lock().await;
+    let target_override = resolve_versioned_binary_path(&version)?;
+
+    // Compose with the candidate version "applied" only in-memory.
+    let mut settings = crate::commands::settings_cmd::current_settings(&app);
+    settings.selected_singbox_version = if version == "bundled" {
+        None
+    } else {
+        Some(version.clone())
+    };
+
+    let (composed, runtime_path) = compose_runtime_config(&app, &state, &settings)?;
+    let scratch = runtime_path.with_file_name("_check.json");
+    if let Some(parent) = scratch.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let bytes = serde_json::to_vec_pretty(&composed.merged)?;
+    crate::util::atomic_write::atomic_write(&scratch, &bytes)?;
+    let report =
+        crate::core::validate::validate_with_binary(&app, target_override.as_deref(), &scratch)
+            .await?;
+    let _ = std::fs::remove_file(&scratch);
+    Ok(report)
+}
+
 /// Switch to a different sing-box binary:
 ///   1. Build the current runtime config (same overlays as core_start).
 ///   2. Run `<new binary> check -c <scratch path>` to validate that the
 ///      candidate version accepts the merged JSON.
 ///   3. If OK: persist the choice, restart the core under the new binary.
 ///   4. If not OK: leave settings/core untouched and return the report.
+///
+/// The UI's "Validate" button calls `singbox_versions_validate` first;
+/// this command still re-runs validation as a belt-and-braces guard so
+/// stale UI state can't push an unverified binary onto a running core.
 ///
 /// `version == "bundled"` reverts to the Tauri-bundled sidecar.
 #[tauri::command]
@@ -444,25 +507,16 @@ pub async fn singbox_versions_select(
     state: State<'_, AppState>,
 ) -> AppResult<crate::core::validate::ValidationReport> {
     let _guard = state.settings_op.lock().await;
-    let mut settings = crate::commands::settings_cmd::current_settings(&app);
-    let target_override: Option<std::path::PathBuf> = if version == "bundled" || version.is_empty() {
-        None
-    } else {
-        let dir = crate::core::binaries::version_dir(&version)?;
-        let p = dir.join(if cfg!(target_os = "windows") { "sing-box.exe" } else { "sing-box" });
-        if !p.is_file() {
-            return Err(AppError::Other(format!(
-                "version '{version}' is not installed (no binary at {})",
-                p.display()
-            )));
-        }
-        Some(p)
-    };
+    let target_override = resolve_versioned_binary_path(&version)?;
 
     // Pretend the new version is selected, just for compose. Don't
     // persist yet — only do that after validation passes.
-    settings.selected_singbox_version =
-        if version == "bundled" { None } else { Some(version.clone()) };
+    let mut settings = crate::commands::settings_cmd::current_settings(&app);
+    settings.selected_singbox_version = if version == "bundled" {
+        None
+    } else {
+        Some(version.clone())
+    };
 
     // Compose runtime config + write to a scratch file we can pass to
     // `sing-box check`. We avoid clobbering the live runtime/config.json

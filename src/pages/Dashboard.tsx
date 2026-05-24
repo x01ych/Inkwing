@@ -1,4 +1,4 @@
-import { Download, Loader2, RefreshCcw, ShieldCheck, Trash2 } from 'lucide-react';
+import { Check, Download, Loader2, RefreshCcw, ShieldCheck, Trash2, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Area, AreaChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { Link } from 'react-router-dom';
@@ -9,6 +9,7 @@ import {
   type InstalledBinary,
   type PrivilegeReport,
 } from '../api/core';
+import { settingsApi } from '../api/settings';
 import SingboxVersionDialog from '../components/dialogs/SingboxVersionDialog';
 import {
   Select,
@@ -52,8 +53,16 @@ export default function Dashboard() {
   const [installed, setInstalled] = useState<InstalledBinary[]>([]);
   const [selectedVersion, setSelectedVersion] = useState<string>('bundled');
   const [applyingVersion, setApplyingVersion] = useState(false);
+  const [validatingVersion, setValidatingVersion] = useState(false);
   const [versionDialogOpen, setVersionDialogOpen] = useState(false);
   const [versionError, setVersionError] = useState<string[]>([]);
+  // Validation state machine for the candidate version. `idle` means
+  // the user has changed the dropdown but hasn't clicked Validate yet
+  // — Apply is locked until validation passes.
+  const [validationState, setValidationState] = useState<
+    'idle' | 'valid' | 'invalid'
+  >('idle');
+  const setSettings = useSettingsStore((s) => s.setSettings);
 
   useEventListener(() => onTraffic((t) => pushTraffic(t)));
   useEventListener(() =>
@@ -95,9 +104,19 @@ export default function Dashboard() {
   }, []);
 
   // Keep the dropdown in sync with whatever's persisted in settings.
+  // Resetting selectedVersion clears validation state via the
+  // dependent effect below.
   useEffect(() => {
     setSelectedVersion(settings?.selected_singbox_version ?? 'bundled');
   }, [settings?.selected_singbox_version]);
+
+  // Any time the user picks a different version from the dropdown,
+  // invalidate any previous Validate result so they must re-validate
+  // before Apply unlocks.
+  useEffect(() => {
+    setValidationState('idle');
+    setVersionError([]);
+  }, [selectedVersion]);
 
   const running = !!status?.running;
   const last = traffic[traffic.length - 1];
@@ -120,12 +139,41 @@ export default function Dashboard() {
     }
   }
 
+  async function handleValidateVersion() {
+    setValidatingVersion(true);
+    setVersionError([]);
+    try {
+      const report = await singboxVersionsApi.validate(selectedVersion);
+      if (report.ok) {
+        setValidationState('valid');
+        toast.success(
+          `Validated ${selectedVersion === 'bundled' ? 'bundled' : selectedVersion} — Apply unlocked`
+        );
+      } else {
+        setValidationState('invalid');
+        setVersionError(
+          report.errors.length > 0
+            ? report.errors.map((e) => `${e.level}: ${e.message}`)
+            : [`sing-box check failed (exit ${report.exit_code ?? '?'})`]
+        );
+      }
+    } catch (e) {
+      const msg = String((e as Error)?.message ?? e);
+      setValidationState('invalid');
+      setVersionError([msg]);
+      toast.error(msg);
+    } finally {
+      setValidatingVersion(false);
+    }
+  }
+
   async function handleApplyVersion() {
     setApplyingVersion(true);
     setVersionError([]);
     try {
       const report = await singboxVersionsApi.select(selectedVersion);
       if (!report.ok) {
+        setValidationState('invalid');
         setVersionError(
           report.errors.length > 0
             ? report.errors.map((e) => `${e.level}: ${e.message}`)
@@ -136,11 +184,21 @@ export default function Dashboard() {
       toast.success(
         `Switched to ${selectedVersion === 'bundled' ? 'bundled' : selectedVersion} — core restarted`
       );
-      const [s, v] = await Promise.all([coreApi.status(), coreApi.version()]);
+      // Refresh settings so the dropdown reflects the now-applied
+      // version (fixes the "still shows bundled after apply" bug).
+      const [s, v, fresh] = await Promise.all([
+        coreApi.status(),
+        coreApi.version(),
+        settingsApi.get(),
+      ]);
       setStatus(s);
       setVersion(v);
+      setSettings(fresh);
+      // Validation state is reset by the selectedVersion-sync effect
+      // when settings flows back through.
     } catch (e) {
       const msg = String((e as Error)?.message ?? e);
+      setValidationState('invalid');
       setVersionError([msg]);
       toast.error(msg);
     } finally {
@@ -150,7 +208,7 @@ export default function Dashboard() {
 
   async function handleDeleteVersion() {
     if (selectedVersion === 'bundled') return;
-    if (selectedVersion === (settings?.selected_singbox_version ?? 'bundled')) {
+    if (selectedVersion === appliedVersion) {
       toast.error('Cannot delete the currently active version. Apply bundled first.');
       return;
     }
@@ -158,11 +216,20 @@ export default function Dashboard() {
       await singboxVersionsApi.delete(selectedVersion);
       toast.success(`Removed ${selectedVersion}`);
       await loadInstalled();
-      setSelectedVersion(settings?.selected_singbox_version ?? 'bundled');
+      setSelectedVersion(appliedVersion);
     } catch (e) {
       toast.error(String((e as Error)?.message ?? e));
     }
   }
+
+  // ----- derived: button enablement -----
+  const appliedVersion = settings?.selected_singbox_version ?? 'bundled';
+  const isSameAsApplied = selectedVersion === appliedVersion;
+  const busy = applyingVersion || validatingVersion;
+  const canValidate = !isSameAsApplied && !busy;
+  const canApply = !isSameAsApplied && !busy && validationState === 'valid';
+  const canDelete =
+    !isSameAsApplied && selectedVersion !== 'bundled' && !busy;
 
   return (
     <div className="flex flex-col gap-6">
@@ -346,20 +413,50 @@ export default function Dashboard() {
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {installed.map((b) => (
-                  <SelectItem key={b.version} value={b.version}>
-                    {b.version}
-                    {b.is_bundled ? ' (bundled)' : ''}
-                  </SelectItem>
-                ))}
+                {installed.map((b) => {
+                  const isActive = b.version === appliedVersion;
+                  return (
+                    <SelectItem key={b.version} value={b.version}>
+                      {b.version}
+                      {b.is_bundled ? ' (bundled)' : ''}
+                      {isActive ? ' · active' : ''}
+                    </SelectItem>
+                  );
+                })}
               </SelectContent>
             </Select>
+
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleValidateVersion}
+              disabled={!canValidate}
+              title={
+                isSameAsApplied
+                  ? 'This version is already active'
+                  : `Dry-run sing-box check against the candidate binary`
+              }
+            >
+              {validatingVersion ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : validationState === 'valid' ? (
+                <Check className="h-4 w-4 text-emerald-500" />
+              ) : validationState === 'invalid' ? (
+                <X className="h-4 w-4 text-destructive" />
+              ) : null}
+              Validate
+            </Button>
+
             <Button
               size="sm"
               onClick={handleApplyVersion}
-              disabled={
-                applyingVersion ||
-                selectedVersion === (settings?.selected_singbox_version ?? 'bundled')
+              disabled={!canApply}
+              title={
+                isSameAsApplied
+                  ? 'This version is already active'
+                  : validationState !== 'valid'
+                  ? 'Click Validate first'
+                  : 'Persist this version and restart sing-box'
               }
             >
               {applyingVersion ? (
@@ -367,16 +464,19 @@ export default function Dashboard() {
               ) : null}
               Apply
             </Button>
+
             {selectedVersion !== 'bundled' && (
               <Button
                 size="sm"
                 variant="ghost"
                 className="text-destructive hover:text-destructive"
-                disabled={
-                  applyingVersion ||
-                  selectedVersion === (settings?.selected_singbox_version ?? 'bundled')
-                }
+                disabled={!canDelete}
                 onClick={handleDeleteVersion}
+                title={
+                  isSameAsApplied
+                    ? 'Active version — switch away before deleting'
+                    : 'Remove this version from disk'
+                }
               >
                 <Trash2 className="h-4 w-4" />
                 Delete
@@ -384,9 +484,30 @@ export default function Dashboard() {
             )}
           </div>
 
+          {isSameAsApplied && (
+            <p className="text-xs text-muted-foreground">
+              This version is currently active. Pick a different one to Validate / Apply.
+            </p>
+          )}
+          {!isSameAsApplied && validationState === 'idle' && (
+            <p className="text-xs text-muted-foreground">
+              Click Validate to dry-run <code>sing-box check</code> with the candidate binary
+              before applying.
+            </p>
+          )}
+          {!isSameAsApplied && validationState === 'valid' && (
+            <p className="text-xs text-emerald-500">
+              Validation passed — Apply is now unlocked.
+            </p>
+          )}
+
           {versionError.length > 0 && (
             <Alert variant="destructive">
-              <AlertTitle>Validation failed — core not switched</AlertTitle>
+              <AlertTitle>
+                {applyingVersion
+                  ? 'Apply failed — core not switched'
+                  : 'Validation failed — core not switched'}
+              </AlertTitle>
               <AlertDescription>
                 <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap text-xs">
                   {versionError.join('\n')}

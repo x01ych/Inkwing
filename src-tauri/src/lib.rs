@@ -75,6 +75,7 @@ pub fn run() {
             commands::core_cmd::singbox_versions_list_remote,
             commands::core_cmd::singbox_versions_download,
             commands::core_cmd::singbox_versions_delete,
+            commands::core_cmd::singbox_versions_validate,
             commands::core_cmd::singbox_versions_select,
             commands::core_cmd::logs_recent,
             #[cfg(target_os = "linux")]
