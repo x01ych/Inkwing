@@ -120,6 +120,16 @@ pub fn run() {
             commands::config_cmd::hydrate_on_startup(app.handle());
             // Background subscription scheduler (interval / daily-at).
             core::subscription_scheduler::spawn(app.handle().clone());
+            // Auto-open DevTools when INKWING_DEVTOOLS=1 is set. Lets
+            // remote users run JS in the console for diagnostics without
+            // needing a debug build. Defaults to off so normal launches
+            // don't surprise people with an inspector window.
+            if std::env::var("INKWING_DEVTOOLS").ok().as_deref() == Some("1") {
+                if let Some(w) = app.get_webview_window("main") {
+                    w.open_devtools();
+                    tracing::info!("DevTools opened (INKWING_DEVTOOLS=1)");
+                }
+            }
             Ok(())
         })
         // Window-close interception: hide to tray when the user has
