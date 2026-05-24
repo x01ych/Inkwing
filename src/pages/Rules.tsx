@@ -17,6 +17,7 @@ import { toast } from 'sonner';
 import {
   ruleSetsApi,
   rulesApi,
+  type RouteProbeReport,
   type RuleSetInput,
   type RuleSetViewWithBadge,
   type RuleViewWithBadge,
@@ -589,11 +590,25 @@ function RuleSetsTab() {
   const [deleteTarget, setDeleteTarget] = useState<RuleSetViewWithBadge | null>(null);
   const [refreshingTags, setRefreshingTags] = useState<Set<string>>(new Set());
   const [refreshingAll, setRefreshingAll] = useState(false);
+  const [probe, setProbe] = useState<RouteProbeReport | null>(null);
 
   async function refresh() {
     setLoadErr('');
     try {
-      setList(await ruleSetsApi.list());
+      const rows = await ruleSetsApi.list();
+      setList(rows);
+      // Only fetch the probe when the list is empty — when there are
+      // entries the probe is just noise. The cost is one extra IPC on
+      // first load of an empty config; cheap.
+      if (rows.length === 0) {
+        try {
+          setProbe(await ruleSetsApi.probe());
+        } catch {
+          setProbe(null);
+        }
+      } else {
+        setProbe(null);
+      }
     } catch (e) {
       setLoadErr(String((e as Error)?.message ?? e));
     }
@@ -795,18 +810,8 @@ function RuleSetsTab() {
           <TableBody>
             {list.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={7} className="py-6 text-sm text-muted-foreground">
-                  <div className="space-y-1.5">
-                    <div>No rule_set entries in the active config.</div>
-                    <div className="text-xs">
-                      sing-box rule_sets live at <code className="text-xs">route.rule_set</code>{' '}
-                      in your config (plural array, sibling of{' '}
-                      <code className="text-xs">route.rules</code>). Active source:{' '}
-                      <code className="text-xs">{summary.path}</code>. Open the Config page →
-                      View to confirm the field exists, or click{' '}
-                      <strong>Add rule_set</strong> above to define one as a local override.
-                    </div>
-                  </div>
+                <TableCell colSpan={7} className="py-6">
+                  <RuleSetsEmptyState probe={probe} configPath={summary.path} />
                 </TableCell>
               </TableRow>
             ) : (
@@ -1040,4 +1045,117 @@ function formatRelativeAgo(ts: number): string {
   if (hr < 24) return `${hr} h ago`;
   const d = Math.round(hr / 24);
   return `${d} d ago`;
+}
+
+/**
+ * Self-explaining empty state for the Rule Sets tab. Decodes the
+ * RouteProbeReport from the backend into a one-line root cause instead
+ * of just saying "No rule_set entries", so the user knows whether the
+ * field is missing entirely / mistyped / present-but-empty / etc.
+ */
+function RuleSetsEmptyState({
+  probe,
+  configPath,
+}: {
+  probe: RouteProbeReport | null;
+  configPath: string;
+}) {
+  const cause: { headline: string; hint: React.ReactNode } = (() => {
+    if (!probe) {
+      return {
+        headline: 'No rule_set entries.',
+        hint: (
+          <>
+            sing-box rule_sets live at <code className="text-xs">route.rule_set</code> in your
+            config (plural array, sibling of <code className="text-xs">route.rules</code>).
+          </>
+        ),
+      };
+    }
+    if (!probe.config_loaded) {
+      return {
+        headline: 'No config loaded.',
+        hint: <>Open the Config page and select one.</>,
+      };
+    }
+    if (!probe.has_route) {
+      return {
+        headline: 'The active config has no top-level "route" block.',
+        hint: (
+          <>
+            sing-box configs put rule_set definitions under{' '}
+            <code className="text-xs">route.rule_set</code>. Yours has no{' '}
+            <code className="text-xs">route</code> object at all — add one (or click{' '}
+            <strong>Add rule_set</strong> above to create the first entry as a local override).
+          </>
+        ),
+      };
+    }
+    if (probe.similar_route_keys.length > 0) {
+      return {
+        headline: `Found a typo'd field: "route.${probe.similar_route_keys[0]}".`,
+        hint: (
+          <>
+            sing-box only recognises <code className="text-xs">route.rule_set</code> (with the
+            underscore). Rename your <code className="text-xs">route.{probe.similar_route_keys[0]}</code>{' '}
+            field via Config → View / Edit.
+          </>
+        ),
+      };
+    }
+    if (!probe.has_route_rule_set) {
+      return {
+        headline: 'The active config has no "route.rule_set" field.',
+        hint: (
+          <>
+            Your <code className="text-xs">route</code> block exists but doesn't declare any
+            rule_sets. Keys present:{' '}
+            <code className="text-xs">{probe.route_keys.join(', ') || '(none)'}</code>.
+            {probe.rules_using_rule_set_matcher > 0 && (
+              <>
+                {' '}
+                <strong className="text-amber-500">
+                  ⚠ {probe.rules_using_rule_set_matcher} of your {probe.rules_total} routing
+                  rule(s) reference a rule_set tag
+                </strong>{' '}
+                — those references will fail validation until you define them here.
+              </>
+            )}{' '}
+            Click <strong>Add rule_set</strong> above to create one as a local override.
+          </>
+        ),
+      };
+    }
+    if (!probe.route_rule_set_is_array) {
+      return {
+        headline: '"route.rule_set" exists but is not a JSON array.',
+        hint: (
+          <>
+            sing-box expects an array of rule_set objects under{' '}
+            <code className="text-xs">route.rule_set</code>. Edit Config → View to fix.
+          </>
+        ),
+      };
+    }
+    // route.rule_set is an empty array.
+    return {
+      headline: '"route.rule_set" is an empty array in the active config.',
+      hint: (
+        <>
+          The field exists but has no entries yet. Click <strong>Add rule_set</strong> above to
+          define one as a local override, or edit your source config.
+        </>
+      ),
+    };
+  })();
+
+  return (
+    <div className="space-y-1.5 text-sm text-muted-foreground">
+      <div className="font-medium text-foreground">{cause.headline}</div>
+      <div className="text-xs">{cause.hint}</div>
+      <div className="text-[11px] text-muted-foreground">
+        Active source: <code className="text-[11px]">{configPath}</code>
+      </div>
+    </div>
+  );
 }

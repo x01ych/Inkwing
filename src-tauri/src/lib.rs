@@ -127,6 +127,7 @@ pub fn run() {
             commands::rules_cmd::rule_sets_commit,
             commands::rules_cmd::rule_set_refresh,
             commands::rules_cmd::rule_set_refresh_all,
+            commands::rules_cmd::rule_sets_probe,
             commands::dns_cmd::dns_servers_list,
             commands::dns_cmd::dns_servers_add,
             commands::dns_cmd::dns_servers_update,

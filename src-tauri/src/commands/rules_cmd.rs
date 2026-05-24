@@ -432,6 +432,99 @@ pub async fn rules_commit(
 
 // ---------- route.rule_set commands -------------------------------------
 
+/// Diagnostic probe of the active source config's `route` section so the
+/// empty Rule Sets tab can explain *why* it's empty (missing route
+/// entirely? rule_set under a different / mistyped key? present-but-empty?).
+#[derive(Debug, Clone, Serialize)]
+pub struct RouteProbeReport {
+    pub config_loaded: bool,
+    pub config_path: Option<String>,
+    pub has_route: bool,
+    /// All top-level keys directly under `route` in user's source config.
+    pub route_keys: Vec<String>,
+    pub has_route_rule_set: bool,
+    pub route_rule_set_is_array: bool,
+    pub route_rule_set_len: usize,
+    /// Keys that look like a mistyped `rule_set` field (e.g. `ruleset`,
+    /// `rule-set`, `RuleSet`, `rule_sets`). Empty unless we spot one.
+    pub similar_route_keys: Vec<String>,
+    /// First 3 chars-truncated rule entries from `route.rules`, so the
+    /// user can see whether their rules use `rule_set` matchers that
+    /// reference tags they haven't actually defined yet.
+    pub rules_using_rule_set_matcher: usize,
+    pub rules_total: usize,
+}
+
+#[tauri::command]
+pub async fn rule_sets_probe(state: State<'_, AppState>) -> AppResult<RouteProbeReport> {
+    let g = state.config.lock();
+    let parsed = match g.parsed.as_ref() {
+        None => {
+            return Ok(RouteProbeReport {
+                config_loaded: false,
+                config_path: g.path.as_ref().map(|p| p.display().to_string()),
+                has_route: false,
+                route_keys: vec![],
+                has_route_rule_set: false,
+                route_rule_set_is_array: false,
+                route_rule_set_len: 0,
+                similar_route_keys: vec![],
+                rules_using_rule_set_matcher: 0,
+                rules_total: 0,
+            });
+        }
+        Some(v) => v,
+    };
+    let route = parsed.get("route");
+    let has_route = route.is_some();
+    let route_keys: Vec<String> = route
+        .and_then(|r| r.as_object())
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+    let rs = route.and_then(|r| r.get("rule_set"));
+    let route_rule_set_is_array = matches!(rs, Some(Value::Array(_)));
+    let route_rule_set_len = rs
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+
+    // Catch common typos / casing differences.
+    let likely_typos: &[&str] = &[
+        "ruleset", "rulesets", "rule_sets", "rule-set", "ruleSet", "RuleSet",
+        "providers", "rule_provider", "rule-provider", "rule_providers",
+    ];
+    let similar_route_keys = route_keys
+        .iter()
+        .filter(|k| likely_typos.iter().any(|t| t.eq_ignore_ascii_case(k.as_str())))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let rules = route
+        .and_then(|r| r.get("rules"))
+        .and_then(|v| v.as_array());
+    let rules_total = rules.map(|a| a.len()).unwrap_or(0);
+    let rules_using_rule_set_matcher = rules
+        .map(|arr| {
+            arr.iter()
+                .filter(|r| r.get("rule_set").is_some())
+                .count()
+        })
+        .unwrap_or(0);
+
+    Ok(RouteProbeReport {
+        config_loaded: true,
+        config_path: g.path.as_ref().map(|p| p.display().to_string()),
+        has_route,
+        route_keys,
+        has_route_rule_set: rs.is_some(),
+        route_rule_set_is_array,
+        route_rule_set_len,
+        similar_route_keys,
+        rules_using_rule_set_matcher,
+        rules_total,
+    })
+}
+
 #[tauri::command]
 pub async fn rule_sets_list(
     app: AppHandle,

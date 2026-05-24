@@ -130,6 +130,23 @@ export interface RuleSetRefreshResult {
   error: string | null;
 }
 
+export interface RouteProbeReport {
+  config_loaded: boolean;
+  config_path: string | null;
+  has_route: boolean;
+  /** All keys directly under `route` in the user's source config. */
+  route_keys: string[];
+  has_route_rule_set: boolean;
+  route_rule_set_is_array: boolean;
+  route_rule_set_len: number;
+  /** Keys that look like a typo'd version of `rule_set` (e.g. `ruleset`). */
+  similar_route_keys: string[];
+  /** Counts so we can tell users their rules reference rule_sets they
+   * never defined. */
+  rules_using_rule_set_matcher: number;
+  rules_total: number;
+}
+
 export interface RuleSetInput {
   tag: string;
   kind: 'local' | 'remote';
@@ -170,4 +187,7 @@ export const ruleSetsApi = {
   /** Wipes all cached rule_sets and restarts sing-box; each remote
    * rule_set then re-downloads on startup. */
   refreshAll: () => invoke<RuleSetRefreshResult[]>('rule_set_refresh_all'),
+  /** Diagnostic probe of the active config's `route` section so the
+   * empty Rule Sets tab can explain WHY it's empty. */
+  probe: () => invoke<RouteProbeReport>('rule_sets_probe'),
 };
