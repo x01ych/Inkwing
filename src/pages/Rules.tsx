@@ -795,8 +795,18 @@ function RuleSetsTab() {
           <TableBody>
             {list.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={7} className="h-24 text-center text-sm text-muted-foreground">
-                  No rule_set entries
+                <TableCell colSpan={7} className="py-6 text-sm text-muted-foreground">
+                  <div className="space-y-1.5">
+                    <div>No rule_set entries in the active config.</div>
+                    <div className="text-xs">
+                      sing-box rule_sets live at <code className="text-xs">route.rule_set</code>{' '}
+                      in your config (plural array, sibling of{' '}
+                      <code className="text-xs">route.rules</code>). Active source:{' '}
+                      <code className="text-xs">{summary.path}</code>. Open the Config page →
+                      View to confirm the field exists, or click{' '}
+                      <strong>Add rule_set</strong> above to define one as a local override.
+                    </div>
+                  </div>
                 </TableCell>
               </TableRow>
             ) : (

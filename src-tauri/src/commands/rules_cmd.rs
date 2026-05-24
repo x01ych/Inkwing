@@ -437,8 +437,37 @@ pub async fn rule_sets_list(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> AppResult<Vec<RuleSetViewWithBadge>> {
-    let (_active, per, global) = load_overrides_for_active(&app, &state)?;
+    let (active_id, per, global) = load_overrides_for_active(&app, &state)?;
     let source = source_array(&state, "/route/rule_set");
+
+    // Diagnostic: surface the read-path state so an empty Rules tab is
+    // easy to debug (active config? source has rule_set? overrides?).
+    let parsed_state = {
+        let g = state.config.lock();
+        match g.parsed.as_ref() {
+            None => "parsed=None",
+            Some(p) => {
+                if p.pointer("/route/rule_set").is_some() {
+                    "parsed=Some, /route/rule_set present"
+                } else if p.pointer("/route").is_some() {
+                    "parsed=Some, /route present, /route/rule_set MISSING"
+                } else {
+                    "parsed=Some, /route MISSING"
+                }
+            }
+        }
+    };
+    tracing::info!(
+        active_id = ?active_id,
+        parsed_state = %parsed_state,
+        source_len = source.len(),
+        per_appended = per.route_rule_set.appended.len(),
+        per_modifications = per.route_rule_set.modifications.len(),
+        per_masked = per.route_rule_set.masked.len(),
+        global_appended = global.route_rule_set.len(),
+        "rule_sets_list called"
+    );
+
     let mut merged = merge_rule_sets_for_view(
         &source,
         &per.route_rule_set,
