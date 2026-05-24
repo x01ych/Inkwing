@@ -157,4 +157,36 @@ mod tests {
         std::fs::write(&path, b"{ this is not json").unwrap();
         assert!(load_from_path(&path).is_err());
     }
+
+    /// Regression: the path source_array follows on the Rules page.
+    /// A config with `/route/rule_set` populated must round-trip through
+    /// load_from_path + the `pointer("/route/rule_set")` lookup that
+    /// `rules_cmd::source_array` uses, so the rule_set tab is never
+    /// empty when the user's source config actually has entries.
+    #[test]
+    fn route_rule_set_array_survives_load_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.json");
+        let body = br#"{
+    "log": { "level": "info" },
+    "outbounds": [{ "type": "direct", "tag": "direct" }],
+    "route": {
+        "rule_set": [
+            { "tag": "geosite-cn", "type": "remote", "format": "binary",
+              "url": "https://example.test/geosite-cn.srs", "update_interval": "1d" },
+            { "tag": "geoip-cn", "type": "remote", "format": "binary",
+              "url": "https://example.test/geoip-cn.srs" }
+        ],
+        "rules": []
+    }
+}"#;
+        std::fs::write(&path, body).unwrap();
+        let (_raw, parsed) = load_from_path(&path).unwrap();
+        let rs = parsed
+            .pointer("/route/rule_set")
+            .and_then(|v| v.as_array())
+            .expect("rule_set should be present as an array");
+        assert_eq!(rs.len(), 2);
+        assert_eq!(rs[0].get("tag").and_then(|v| v.as_str()), Some("geosite-cn"));
+    }
 }

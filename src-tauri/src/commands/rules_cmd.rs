@@ -829,3 +829,100 @@ pub async fn rule_set_refresh_all(
         .collect())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Regression: a config with route.rule_set populated must survive
+    /// merge_rule_sets_for_view → the table is built off this list.
+    /// The "Last update" / "Etag" enrichment in rule_sets_list is
+    /// non-fatal, so even with cache.db absent the entries must surface.
+    #[test]
+    fn merge_returns_all_source_entries() {
+        let source = vec![
+            json!({
+                "tag": "geosite-cn",
+                "type": "remote",
+                "format": "binary",
+                "url": "https://example.test/geosite-cn.srs",
+                "update_interval": "1d"
+            }),
+            json!({
+                "tag": "geoip-cn",
+                "type": "remote",
+                "format": "binary",
+                "url": "https://example.test/geoip-cn.srs"
+            }),
+            json!({
+                "tag": "my-local",
+                "type": "local",
+                "format": "source",
+                "path": "/tmp/local.json"
+            }),
+        ];
+        let per = ArrayOverrides::default();
+        let global: Vec<LocalEntry> = vec![];
+
+        let merged = merge_rule_sets_for_view(&source, &per, &global);
+
+        assert_eq!(merged.len(), 3, "should return all 3 source rule_sets");
+        assert_eq!(merged[0].view.tag, "geosite-cn");
+        assert_eq!(merged[0].view.kind, "remote");
+        assert!(merged[0].view.editable);
+        assert!(matches!(merged[0].source, RuleSource::Config));
+        assert!(!merged[0].masked);
+        assert!(!merged[0].modified);
+        // last_updated_ms/etag are populated by rule_sets_list's cache.db
+        // enrichment, not by merge_rule_sets_for_view itself.
+        assert!(merged[0].view.last_updated_ms.is_none());
+        assert!(merged[0].view.etag.is_none());
+
+        assert_eq!(merged[1].view.tag, "geoip-cn");
+        assert_eq!(merged[2].view.tag, "my-local");
+        assert_eq!(merged[2].view.kind, "local");
+    }
+
+    #[test]
+    fn merge_returns_empty_for_empty_source() {
+        let source: Vec<Value> = vec![];
+        let per = ArrayOverrides::default();
+        let global: Vec<LocalEntry> = vec![];
+        let merged = merge_rule_sets_for_view(&source, &per, &global);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn merge_includes_per_config_appended_and_global() {
+        let source: Vec<Value> = vec![];
+        let mut per = ArrayOverrides::default();
+        per.appended.push(LocalEntry {
+            id: "uuid-per".into(),
+            value: json!({
+                "tag": "per-cfg-set",
+                "type": "remote",
+                "format": "binary",
+                "url": "https://example.test/per.srs"
+            }),
+            created_at_ms: 0,
+        });
+        let global = vec![LocalEntry {
+            id: "uuid-glob".into(),
+            value: json!({
+                "tag": "global-set",
+                "type": "local",
+                "format": "source",
+                "path": "/tmp/g.json"
+            }),
+            created_at_ms: 0,
+        }];
+
+        let merged = merge_rule_sets_for_view(&source, &per, &global);
+        assert_eq!(merged.len(), 2);
+        assert!(matches!(merged[0].source, RuleSource::LocalPer));
+        assert_eq!(merged[0].view.tag, "per-cfg-set");
+        assert!(matches!(merged[1].source, RuleSource::LocalGlobal));
+        assert_eq!(merged[1].view.tag, "global-set");
+    }
+}
+
