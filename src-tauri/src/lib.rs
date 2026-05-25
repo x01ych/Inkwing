@@ -21,8 +21,12 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// stderr-only tracing output gets dropped — making "what did the
 /// backend see at the time of …" impossible to diagnose remotely.
 fn init_tracing() {
+    // Default to info only. Pass RUST_LOG=debug or
+    // RUST_LOG=info,inkwing_lib=debug at launch to get the more
+    // verbose traces (cache fallback paths, scheduler skip
+    // decisions, etc.) when diagnosing an issue.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,inkwing_lib=debug"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
 
     // Best effort: also write logs to `<data_dir>/inkwing.log` so that

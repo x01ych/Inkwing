@@ -566,23 +566,24 @@ pub async fn rule_sets_list(
         &per.route_rule_set,
         &global.route_rule_set,
     );
-    tracing::info!(merged_len = merged.len(), "rule_sets_list step 1: merge done");
 
     // Best-effort: enrich each row with sing-box's own last_updated /
     // etag from cache.db. Failures are non-fatal — the UI just shows
-    // "Never" for those rows. Wrap the WHOLE block in
-    // spawn_blocking + a timeout so a slow / blocking jammdb call on
-    // Windows (cache.db is locked by sing-box, or the file is large,
-    // or some FS oddity) can't hang the entire rule_sets_list command.
+    // "Never" for those rows.
+    //
+    // Known limitation: jammdb 0.11 cannot parse the bbolt format
+    // sing-box 1.13+ produces (meta-page page-id mismatch — sing-box
+    // writes id=4 where jammdb asserts id=3). The cache read panics
+    // inside jammdb. We catch that here by isolating the call in a
+    // spawn_blocking task (which catches panics into JoinError) and
+    // bounding it with a 2 s timeout (defence against unrelated hangs
+    // like a locked file). When enrichment fails, "Last update"
+    // shows "Never" but the rule_set list itself still renders fine.
     let cache_id = {
         let g = state.config.lock();
         singbox_cache::cache_id_for(g.parsed.as_ref())
     };
-    tracing::info!(cache_id = %cache_id, "rule_sets_list step 2: cache_id resolved");
     if let Ok(db_path) = cache_file_path() {
-        tracing::info!(db_path = %db_path.display(), exists = db_path.exists(), "rule_sets_list step 3: cache_file_path");
-        // Move the potentially-blocking cache read off the tokio worker
-        // thread, and cap it at 2 seconds so we never hang the IPC.
         let cache_id_owned = cache_id.clone();
         let db_path_owned = db_path.clone();
         let cache_result = tokio::time::timeout(
@@ -594,7 +595,6 @@ pub async fn rule_sets_list(
         .await;
         match cache_result {
             Ok(Ok(Ok(map))) if !map.is_empty() => {
-                tracing::info!(map_len = map.len(), "rule_sets_list step 4: cache enrichment");
                 for row in &mut merged {
                     if let Some(st) = map.get(&row.view.tag) {
                         if st.last_updated_ms > 0 {
@@ -606,25 +606,23 @@ pub async fn rule_sets_list(
                     }
                 }
             }
-            Ok(Ok(Ok(_))) => {
-                tracing::info!("rule_sets_list step 4: cache empty");
-            }
+            Ok(Ok(Ok(_))) => { /* cache empty — first run, no rule_sets fetched yet */ }
             Ok(Ok(Err(e))) => {
-                tracing::warn!("rule_sets_list step 4: singbox_cache read failed: {e}");
+                tracing::debug!("singbox_cache read failed (non-fatal): {e}");
             }
             Ok(Err(join_err)) => {
-                tracing::warn!("rule_sets_list step 4: cache read task panicked: {join_err}");
+                // jammdb panicked. Log once at debug level — the
+                // root cause is a bbolt format incompatibility that's
+                // beyond our reach to fix without swapping crates.
+                tracing::debug!(
+                    "singbox_cache read panicked (non-fatal, falling back to no \"Last update\" column): {join_err}"
+                );
             }
             Err(_) => {
-                tracing::warn!("rule_sets_list step 4: cache read TIMED OUT after 2s — falling back to no enrichment");
+                tracing::debug!("singbox_cache read timed out after 2 s (non-fatal)");
             }
         }
     }
-    tracing::info!(
-        returning = merged.len(),
-        first_tag = merged.first().map(|r| r.view.tag.as_str()).unwrap_or(""),
-        "rule_sets_list returning"
-    );
     Ok(merged)
 }
 
