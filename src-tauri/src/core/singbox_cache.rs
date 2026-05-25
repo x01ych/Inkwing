@@ -14,21 +14,23 @@
 //!            [uvarint etagLen]
 //!            [etag bytes]
 //!
-//! Locking notes:
-//! - sing-box opens cache.db with an exclusive flock, so we can't open
-//!   the live file with jammdb while sing-box is running. For READS we
-//!   copy the file to a temp snapshot first (POSIX flock is advisory —
-//!   copying is unaffected) and open the copy.
-//! - For WRITES (invalidate_*) the caller MUST have stopped sing-box,
-//!   otherwise jammdb will fail to acquire the lock and we propagate
-//!   the error.
+//! Reads go through our own [`bbolt_reader`][crate::core::bbolt_reader],
+//! which we wrote after `jammdb 0.11` was found to panic on sing-box
+//! 1.13+ cache.db files (meta-page id 4 where jammdb asserts 3).
+//!
+//! Writes (refresh / invalidate) used to do surgical key deletion via
+//! jammdb. Since jammdb is incompatible, we fall back to deleting the
+//! whole cache.db file. sing-box rebuilds it on next start and
+//! re-downloads every remote rule_set. That's heavier than necessary
+//! for a single-tag refresh, but it's correct, requires no write
+//! library, and is rare (manual user action).
 
 use std::collections::HashMap;
 use std::path::Path;
 
-use jammdb::{DB, Error as DbError};
 use serde::Serialize;
 
+use crate::core::bbolt_reader;
 use crate::error::{AppError, AppResult};
 
 const DEFAULT_CACHE_ID: &str = "default";
@@ -55,15 +57,15 @@ pub fn cache_id_for(parsed: Option<&serde_json::Value>) -> String {
 }
 
 /// Best-effort: returns an empty map if cache.db doesn't exist yet
-/// (sing-box hasn't been started against this config) or if the schema
-/// doesn't match the documented version-1 layout. The UI then shows
-/// "Never" for last_updated.
+/// (sing-box hasn't been started against this config) or the bbolt
+/// reader can't make sense of it. The UI then shows "Never" for
+/// `last_updated_ms`.
 ///
-/// sing-box mmap-writes the file from another process, so a snapshot we
-/// take mid-flush can briefly look torn (bbolt page checksum failures
-/// in jammdb). Retry the snapshot+open up to 3× with a 100ms backoff to
-/// absorb that — if it still fails, treat as "no data" rather than
-/// propagating to the UI.
+/// Implementation note: we copy the live file into a temporary location
+/// before reading. POSIX flock + Windows LockFile are advisory at the
+/// filesystem-copy layer, so `fs::copy` from a file sing-box has open
+/// just works. Reading the live file directly with mmap risks a torn
+/// page when sing-box's write commit lands mid-iteration.
 pub fn read_rule_set_status(
     db_path: &Path,
     cache_id: &str,
@@ -71,8 +73,12 @@ pub fn read_rule_set_status(
     if !db_path.exists() {
         return Ok(HashMap::new());
     }
+
+    // Three attempts, in case the first snapshot copies a half-written
+    // page set (extremely rare for our access pattern but cheap to
+    // guard against). 100 ms between attempts.
     let mut last_err: Option<AppError> = None;
-    for attempt in 0..3 {
+    for _ in 0..3 {
         let snap = match snapshot_cache_db(db_path) {
             Ok(s) => s,
             Err(e) => {
@@ -81,12 +87,9 @@ pub fn read_rule_set_status(
                 continue;
             }
         };
-        // `snap` is a NamedTempFile that cleans up on drop, so we
-        // don't leak even if read_rule_set_status_inner panics.
         match read_rule_set_status_inner(snap.path(), cache_id) {
             Ok(map) => return Ok(map),
             Err(e) => {
-                tracing::debug!("cache.db snapshot read attempt {} failed: {e}", attempt + 1);
                 last_err = Some(e);
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
@@ -99,41 +102,36 @@ fn read_rule_set_status_inner(
     snapshot_path: &Path,
     cache_id: &str,
 ) -> AppResult<HashMap<String, RuleSetCacheStatus>> {
-    let db = DB::open(snapshot_path).map_err(map_db_err)?;
-    let tx = db.tx(false).map_err(map_db_err)?;
-    let mut out = HashMap::new();
-    let cache_bucket = match tx.get_bucket(cache_id.as_bytes()) {
-        Ok(b) => b,
-        // No bucket for this cache_id yet → no rule_sets cached.
-        Err(DbError::BucketMissing) => return Ok(out),
-        Err(e) => return Err(map_db_err(e)),
-    };
-    let rs_bucket = match cache_bucket.get_bucket("rule_set") {
-        Ok(b) => b,
-        Err(DbError::BucketMissing) => return Ok(out),
-        Err(e) => return Err(map_db_err(e)),
-    };
-    for kv in rs_bucket.kv_pairs() {
-        let tag = String::from_utf8_lossy(kv.key()).into_owned();
-        let value: &[u8] = kv.value();
-        match decode_saved_binary(value) {
-            Some(s) => {
-                out.insert(tag.clone(), RuleSetCacheStatus {
-                    tag,
-                    last_updated_ms: s.0,
-                    etag: s.1,
-                    content_size: s.2,
-                });
+    let blobs = bbolt_reader::read_rule_set_blobs(snapshot_path, cache_id)
+        .map_err(|e| AppError::Other(format!("bbolt read: {e}")))?;
+    let mut out = HashMap::with_capacity(blobs.len());
+    for (tag, bytes) in blobs {
+        let size = bytes.len() as u64;
+        match decode_saved_binary(&bytes) {
+            Some((ts, etag, content_size)) => {
+                out.insert(
+                    tag.clone(),
+                    RuleSetCacheStatus {
+                        tag,
+                        last_updated_ms: ts,
+                        etag,
+                        content_size,
+                    },
+                );
             }
             None => {
-                tracing::warn!("cache.db: rule_set tag '{}' has unrecognised header", tag);
+                tracing::debug!(
+                    "cache.db: rule_set tag '{}' has unrecognised SavedBinary header (size={})",
+                    tag,
+                    size
+                );
                 out.insert(
                     tag.clone(),
                     RuleSetCacheStatus {
                         tag,
                         last_updated_ms: 0,
                         etag: String::new(),
-                        content_size: value.len() as u64,
+                        content_size: size,
                     },
                 );
             }
@@ -142,62 +140,48 @@ fn read_rule_set_status_inner(
     Ok(out)
 }
 
-/// Delete the cached entry for one rule_set tag. Caller must have
-/// stopped sing-box first or this will fail with a lock error.
+/// Invalidate a single rule_set's cache entry. We don't have a bbolt
+/// writer available (jammdb panics on sing-box's format, and writing
+/// our own writer is significant work), so we degrade to nuking the
+/// whole cache.db file. sing-box recreates it on next start and
+/// re-downloads every remote rule_set — heavier than necessary but
+/// correct, and only triggered by an explicit user-facing button.
+///
+/// Caller MUST have stopped sing-box first; this is enforced upstream
+/// (`rule_set_refresh` runs `core_stop` before calling here).
 pub fn invalidate_rule_set(
     db_path: &Path,
-    cache_id: &str,
-    tag: &str,
+    _cache_id: &str,
+    _tag: &str,
 ) -> AppResult<()> {
-    if !db_path.exists() {
-        // Nothing to invalidate — sing-box has never written cache.
-        return Ok(());
-    }
-    let db = DB::open(db_path).map_err(map_db_err)?;
-    let tx = db.tx(true).map_err(map_db_err)?;
-    let cache_bucket = match tx.get_bucket(cache_id.as_bytes()) {
-        Ok(b) => b,
-        Err(DbError::BucketMissing) => return Ok(()),
-        Err(e) => return Err(map_db_err(e)),
-    };
-    let rs_bucket = match cache_bucket.get_bucket("rule_set") {
-        Ok(b) => b,
-        Err(DbError::BucketMissing) => return Ok(()),
-        Err(e) => return Err(map_db_err(e)),
-    };
-    match rs_bucket.delete(tag.as_bytes()) {
-        Ok(_) | Err(DbError::KeyValueMissing) => {}
-        Err(e) => return Err(map_db_err(e)),
-    }
-    tx.commit().map_err(map_db_err)?;
-    Ok(())
+    delete_cache_db(db_path)
 }
 
-/// Wipe all cached rule_set entries (sing-box re-downloads everything
-/// on next start). Same locking caveat as `invalidate_rule_set`.
-pub fn invalidate_all_rule_sets(db_path: &Path, cache_id: &str) -> AppResult<()> {
+/// Wipe the entire cache so every remote rule_set re-downloads on the
+/// next sing-box start. Same semantics as `invalidate_rule_set` —
+/// we always delete the whole file because partial writes are not
+/// available without a bbolt writer.
+pub fn invalidate_all_rule_sets(db_path: &Path, _cache_id: &str) -> AppResult<()> {
+    delete_cache_db(db_path)
+}
+
+fn delete_cache_db(db_path: &Path) -> AppResult<()> {
     if !db_path.exists() {
         return Ok(());
     }
-    let db = DB::open(db_path).map_err(map_db_err)?;
-    let tx = db.tx(true).map_err(map_db_err)?;
-    let cache_bucket = match tx.get_bucket(cache_id.as_bytes()) {
-        Ok(b) => b,
-        Err(DbError::BucketMissing) => return Ok(()),
-        Err(e) => return Err(map_db_err(e)),
-    };
-    match cache_bucket.delete_bucket("rule_set") {
-        Ok(()) | Err(DbError::BucketMissing) => {}
-        Err(e) => return Err(map_db_err(e)),
-    }
-    tx.commit().map_err(map_db_err)?;
+    std::fs::remove_file(db_path)
+        .map_err(|e| AppError::Other(format!("delete cache.db: {e}")))?;
+    tracing::info!(
+        "singbox_cache: removed {} — sing-box will rebuild + re-fetch on next start",
+        db_path.display()
+    );
     Ok(())
 }
 
-/// Copy the live cache.db into a `NamedTempFile` so jammdb's exclusive
-/// flock doesn't fight sing-box's lock on the original. The temp file
-/// is auto-deleted when the returned guard drops, even if the caller
-/// panics — no leaked snapshot files in /tmp.
+/// Copy the live cache.db into a `NamedTempFile` so any platform-level
+/// file locks held by sing-box don't fight us at parse time. The temp
+/// file is auto-deleted when the returned guard drops, even if the
+/// caller panics — no leaked snapshot files in /tmp.
 fn snapshot_cache_db(src: &Path) -> AppResult<tempfile::NamedTempFile> {
     let tmp = tempfile::Builder::new()
         .prefix("inkwing-cache-snapshot-")
@@ -207,10 +191,6 @@ fn snapshot_cache_db(src: &Path) -> AppResult<tempfile::NamedTempFile> {
     std::fs::copy(src, tmp.path())
         .map_err(|e| AppError::Other(format!("snapshot copy: {e}")))?;
     Ok(tmp)
-}
-
-fn map_db_err(e: DbError) -> AppError {
-    AppError::Other(format!("bbolt: {e}"))
 }
 
 /// Returns (last_updated_ms, etag, content_size) on success, None on
@@ -258,7 +238,6 @@ fn read_uvarint(cur: &mut std::io::Cursor<&[u8]>) -> Option<u64> {
         cur.read_exact(&mut b).ok()?;
         let byte = b[0];
         if byte < 0x80 {
-            // Overflow guard for the final byte.
             if s == 63 && byte > 1 {
                 return None;
             }
