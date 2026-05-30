@@ -154,14 +154,15 @@ pub fn apply_tun_overlay(merged: &mut Value, want_tun: Option<bool>) -> AppResul
 ///    here. Drop any non-`utunN` name so sing-box auto-assigns a free utun
 ///    unit; a deliberate valid `utunN` is preserved.
 ///
-/// 2. **stack** — the `system` TUN stack is unreliable on macOS: TCP
-///    connections to many hosts silently stall (sagernet/sing-box#2741,
-///    #2322), so traffic dies and nothing shows up in clash_api
-///    /connections even though DNS still resolves. Rewrite an explicit
-///    `system` to `gvisor` — the fully-userspace stack that reliably
-///    forwards every connection on macOS (and our bundled binary is built
-///    `with_gvisor`). An absent stack is left alone (sing-box then defaults
-///    to `mixed`, which also works), as are explicit `gvisor` / `mixed`.
+/// 2. **stack** — on macOS only `gvisor` (fully userspace) reliably
+///    forwards TCP. Both `system` and the `mixed` default route TCP
+///    through the system stack, which stalls on macOS (sagernet/sing-box
+///    #2741, #2322): DNS still resolves (UDP — handled by gVisor even in
+///    `mixed`) but no TCP connection establishes, so clash_api
+///    /connections stays empty and the browser has no network. Force every
+///    TUN inbound to `gvisor` (our bundled binary is built `with_gvisor`);
+///    an existing `gvisor` is left as-is. An absent stack is also forced,
+///    since it would otherwise default to the broken `mixed`.
 pub fn normalize_macos_tun(merged: &mut Value) {
     if cfg!(target_os = "macos") {
         fixup_macos_tun_inbounds(merged);
@@ -190,10 +191,11 @@ fn fixup_macos_tun_inbounds(merged: &mut Value) {
         if !name_ok {
             obj.remove("interface_name");
         }
-        // (2) stack: the `system` stack is broken on macOS → use gvisor.
-        //     Leave an absent stack (defaults to mixed) and explicit
-        //     gvisor/mixed untouched.
-        if obj.get("stack").and_then(|v| v.as_str()) == Some("system") {
+        // (2) stack: on macOS only gvisor reliably forwards TCP. `system`
+        //     and `mixed` both route TCP through the broken macOS system
+        //     stack; absent defaults to `mixed`. Force gvisor unless it's
+        //     already set.
+        if obj.get("stack").and_then(|v| v.as_str()) != Some("gvisor") {
             obj.insert("stack".to_string(), json!("gvisor"));
         }
     }
@@ -751,25 +753,29 @@ mod tests {
     }
 
     #[test]
-    fn fixup_keeps_good_stacks_untouched() {
-        for stack in ["gvisor", "mixed"] {
-            let mut cfg = json!({
-                "inbounds": [{"type": "tun", "stack": stack}]
-            });
+    fn fixup_forces_gvisor_for_non_gvisor_stacks() {
+        // system, mixed, and absent all route TCP through the broken macOS
+        // system stack (absent defaults to mixed) → force gvisor. `mixed`
+        // is the real-world case from the bug report.
+        for input in [
+            json!({"type": "tun", "stack": "system"}),
+            json!({"type": "tun", "stack": "mixed"}),
+            json!({"type": "tun"}),
+        ] {
+            let mut cfg = json!({ "inbounds": [input.clone()] });
             fixup_macos_tun_inbounds(&mut cfg);
-            assert_eq!(cfg["inbounds"][0]["stack"], stack);
+            assert_eq!(cfg["inbounds"][0]["stack"], "gvisor", "input was {input}");
         }
     }
 
     #[test]
-    fn fixup_leaves_absent_stack_absent() {
-        // No stack → leave it absent (sing-box defaults to mixed, which
-        // works on macOS); only an explicit `system` is rewritten.
+    fn fixup_keeps_explicit_gvisor() {
         let mut cfg = json!({
-            "inbounds": [{"type": "tun", "interface_name": "utun3"}]
+            "inbounds": [{"type": "tun", "interface_name": "utun3", "stack": "gvisor"}]
         });
         fixup_macos_tun_inbounds(&mut cfg);
-        assert!(cfg["inbounds"][0].get("stack").is_none());
+        assert_eq!(cfg["inbounds"][0]["stack"], "gvisor"); // unchanged
+        assert_eq!(cfg["inbounds"][0]["interface_name"], "utun3");
     }
 
     #[test]

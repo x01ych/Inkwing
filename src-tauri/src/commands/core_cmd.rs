@@ -349,8 +349,9 @@ pub(crate) fn compose_runtime_config(
 
     // Final macOS TUN fix-ups (ours, the user's, or an override's): drop an
     // invalid interface_name so sing-box doesn't die with `bad tun name`,
-    // and rewrite the broken `system` stack to gvisor so TCP actually
-    // forwards (and connections show up in /connections). No-op off macOS.
+    // and force the stack to gvisor (the system/mixed stacks route TCP
+    // through the macOS system stack, which stalls) so TCP actually forwards
+    // and connections show up in /connections. No-op off macOS.
     normalize_macos_tun(&mut injected.merged);
 
     let runtime_path = runtime_config_path()?;
