@@ -1,6 +1,6 @@
 [package]
 name = "inkwing"
-version = "0.1.0"
+version = "0.0.2"
 description = "Inkwing — a Tauri 2 desktop client for sing-box that loads native configs without lossy translation."
 authors = ["Inkwing contributors"]
 edition = "2021"
