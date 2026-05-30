@@ -8,7 +8,7 @@ use tauri_plugin_store::StoreExt;
 use crate::core::clash_api::ClashClient;
 use crate::core::clash_inject::{
     apply_cache_file_overlay, apply_local_ports_overlay, apply_mode_overlay, apply_tun_overlay,
-    inject_clash_api, normalize_tun_interface_name,
+    inject_clash_api, normalize_macos_tun,
 };
 use crate::core::conn_pump::spawn_conn_pump;
 use crate::core::log_pump::{spawn_log_pump, LogEntry};
@@ -347,11 +347,11 @@ pub(crate) fn compose_runtime_config(
         crate::core::overrides::apply_overrides_overlay(&mut injected.merged, &per, &global)?;
     }
 
-    // Final platform fix-up: macOS rejects any TUN interface_name that
-    // isn't `utunN`, so strip invalid names (ours, the user's, or an
-    // override's) — sing-box then auto-assigns a free utun unit instead of
-    // dying at bring-up with `bad tun name`. No-op off macOS.
-    normalize_tun_interface_name(&mut injected.merged);
+    // Final macOS TUN fix-ups (ours, the user's, or an override's): drop an
+    // invalid interface_name so sing-box doesn't die with `bad tun name`,
+    // and rewrite the broken `system` stack to gvisor so TCP actually
+    // forwards (and connections show up in /connections). No-op off macOS.
+    normalize_macos_tun(&mut injected.merged);
 
     let runtime_path = runtime_config_path()?;
     let _ = app; // currently unused but kept for future overlay extensions

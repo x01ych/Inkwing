@@ -139,33 +139,38 @@ pub fn apply_tun_overlay(merged: &mut Value, want_tun: Option<bool>) -> AppResul
     Ok(())
 }
 
-/// macOS's `utun` kernel control interface only accepts TUN device names of
-/// the form `utun<N>` (e.g. `utun3`). sing-box's Darwin backend rejects
-/// anything else at bring-up with
-/// `start inbound/tun: configure tun interface: bad tun name: <name>`,
-/// which then trips our 30s clash_api readiness wait and fails the launch.
-/// Our own default inbound uses the friendly `singbox0`, and user /
-/// subscription configs routinely carry names like `singbox_tun` — all fine
-/// on Linux/Windows, all fatal on macOS.
+/// macOS-only fix-ups applied to the final merged config's TUN inbounds.
+/// No-op on Linux/Windows. Runs as the last step of config composition so it
+/// covers TUN inbounds from every source — our default, the user's file, and
+/// overrides alike — keeping the spawn / preflight / restart paths
+/// consistent. Two macOS-specific problems are corrected:
 ///
-/// So, on macOS only, drop any TUN `interface_name` that isn't a valid
-/// `utunN`; sing-box then auto-assigns the first free utun unit. A valid
-/// `utunN` the user picked on purpose is preserved. No-op on Linux/Windows,
-/// where arbitrary names are legal and the friendly name aids identification
-/// and firewall rules.
+/// 1. **interface_name** — macOS's `utun` kernel control only accepts names
+///    of the form `utun<N>` (e.g. `utun3`). sing-box's Darwin backend
+///    rejects anything else at bring-up with `configure tun interface: bad
+///    tun name: <name>`, which trips our 30s clash_api readiness wait and
+///    fails the launch. Our default uses the friendly `singbox0` and user
+///    configs carry names like `singbox_tun` — fine on Linux/Windows, fatal
+///    here. Drop any non-`utunN` name so sing-box auto-assigns a free utun
+///    unit; a deliberate valid `utunN` is preserved.
 ///
-/// Runs as the final step of config composition so it catches TUN inbounds
-/// from every source — our default, the user's file, and overrides alike.
-pub fn normalize_tun_interface_name(merged: &mut Value) {
+/// 2. **stack** — the `system` TUN stack is unreliable on macOS: TCP
+///    connections to many hosts silently stall (sagernet/sing-box#2741,
+///    #2322), so traffic dies and nothing shows up in clash_api
+///    /connections even though DNS still resolves. Rewrite an explicit
+///    `system` to `gvisor` — the fully-userspace stack that reliably
+///    forwards every connection on macOS (and our bundled binary is built
+///    `with_gvisor`). An absent stack is left alone (sing-box then defaults
+///    to `mixed`, which also works), as are explicit `gvisor` / `mixed`.
+pub fn normalize_macos_tun(merged: &mut Value) {
     if cfg!(target_os = "macos") {
-        strip_invalid_macos_tun_names(merged);
+        fixup_macos_tun_inbounds(merged);
     }
 }
 
-/// Platform-agnostic worker behind [`normalize_tun_interface_name`] (split
-/// out so it stays unit-testable off macOS): strip every TUN inbound's
-/// `interface_name` unless it is already a valid `utunN`.
-fn strip_invalid_macos_tun_names(merged: &mut Value) {
+/// Platform-agnostic worker behind [`normalize_macos_tun`] (split out so it
+/// stays unit-testable off macOS). See that function for the why.
+fn fixup_macos_tun_inbounds(merged: &mut Value) {
     let Some(inbounds) = merged.get_mut("inbounds").and_then(|v| v.as_array_mut()) else {
         return;
     };
@@ -176,13 +181,20 @@ fn strip_invalid_macos_tun_names(merged: &mut Value) {
         let Some(obj) = inbound.as_object_mut() else {
             continue;
         };
-        let valid = obj
+        // (1) interface_name: drop unless already a valid utunN, so sing-box
+        //     auto-assigns a free unit instead of failing with bad tun name.
+        let name_ok = obj
             .get("interface_name")
             .and_then(|v| v.as_str())
             .is_some_and(is_valid_utun_name);
-        if !valid {
-            // Absent or invalid → remove so sing-box picks a free utun unit.
+        if !name_ok {
             obj.remove("interface_name");
+        }
+        // (2) stack: the `system` stack is broken on macOS → use gvisor.
+        //     Leave an absent stack (defaults to mixed) and explicit
+        //     gvisor/mixed untouched.
+        if obj.get("stack").and_then(|v| v.as_str()) == Some("system") {
+            obj.insert("stack".to_string(), json!("gvisor"));
         }
     }
 }
@@ -668,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn strips_invalid_tun_name_but_preserves_other_fields() {
+    fn fixup_corrects_default_tun_inbound_on_macos() {
         let mut cfg = json!({
             "inbounds": [{
                 "type": "tun",
@@ -679,13 +691,13 @@ mod tests {
                 "stack": "system"
             }]
         });
-        strip_invalid_macos_tun_names(&mut cfg);
+        fixup_macos_tun_inbounds(&mut cfg);
         let inb = &cfg["inbounds"][0];
-        assert!(inb.get("interface_name").is_none()); // stripped → auto-assign
+        assert!(inb.get("interface_name").is_none()); // dropped → auto-assign
+        assert_eq!(inb["stack"], "gvisor"); // system → gvisor on macOS
         assert_eq!(inb["tag"], "tun-in"); // everything else verbatim
         assert_eq!(inb["address"], json!(["172.19.0.1/30"]));
         assert_eq!(inb["auto_route"], json!(true));
-        assert_eq!(inb["stack"], "system");
     }
 
     #[test]
@@ -694,7 +706,7 @@ mod tests {
         let mut cfg = json!({
             "inbounds": [{"type": "tun", "interface_name": "singbox_tun"}]
         });
-        strip_invalid_macos_tun_names(&mut cfg);
+        fixup_macos_tun_inbounds(&mut cfg);
         assert!(cfg["inbounds"][0].get("interface_name").is_none());
     }
 
@@ -703,7 +715,7 @@ mod tests {
         let mut cfg = json!({
             "inbounds": [{"type": "tun", "interface_name": "utun9"}]
         });
-        strip_invalid_macos_tun_names(&mut cfg);
+        fixup_macos_tun_inbounds(&mut cfg);
         assert_eq!(cfg["inbounds"][0]["interface_name"], "utun9");
     }
 
@@ -713,18 +725,60 @@ mod tests {
         let mut cfg = json!({
             "inbounds": [{"type": "mixed", "interface_name": "whatever"}]
         });
-        strip_invalid_macos_tun_names(&mut cfg);
+        fixup_macos_tun_inbounds(&mut cfg);
         assert_eq!(cfg["inbounds"][0]["interface_name"], "whatever");
     }
 
     #[test]
     fn normalize_tolerates_missing_or_nonarray_inbounds() {
         let mut no_inbounds = json!({"outbounds": []});
-        strip_invalid_macos_tun_names(&mut no_inbounds); // must not panic
+        fixup_macos_tun_inbounds(&mut no_inbounds); // must not panic
         assert!(no_inbounds.get("inbounds").is_none());
 
         let mut weird = json!({"inbounds": "not-an-array"});
-        strip_invalid_macos_tun_names(&mut weird); // must not panic
+        fixup_macos_tun_inbounds(&mut weird); // must not panic
         assert_eq!(weird["inbounds"], "not-an-array");
+    }
+
+    #[test]
+    fn fixup_rewrites_explicit_system_stack_to_gvisor() {
+        let mut cfg = json!({
+            "inbounds": [{"type": "tun", "interface_name": "utun4", "stack": "system"}]
+        });
+        fixup_macos_tun_inbounds(&mut cfg);
+        assert_eq!(cfg["inbounds"][0]["stack"], "gvisor");
+        assert_eq!(cfg["inbounds"][0]["interface_name"], "utun4"); // valid name kept
+    }
+
+    #[test]
+    fn fixup_keeps_good_stacks_untouched() {
+        for stack in ["gvisor", "mixed"] {
+            let mut cfg = json!({
+                "inbounds": [{"type": "tun", "stack": stack}]
+            });
+            fixup_macos_tun_inbounds(&mut cfg);
+            assert_eq!(cfg["inbounds"][0]["stack"], stack);
+        }
+    }
+
+    #[test]
+    fn fixup_leaves_absent_stack_absent() {
+        // No stack → leave it absent (sing-box defaults to mixed, which
+        // works on macOS); only an explicit `system` is rewritten.
+        let mut cfg = json!({
+            "inbounds": [{"type": "tun", "interface_name": "utun3"}]
+        });
+        fixup_macos_tun_inbounds(&mut cfg);
+        assert!(cfg["inbounds"][0].get("stack").is_none());
+    }
+
+    #[test]
+    fn fixup_leaves_non_tun_stack_alone() {
+        // `stack` is meaningless on a non-tun inbound; don't touch it.
+        let mut cfg = json!({
+            "inbounds": [{"type": "mixed", "stack": "system"}]
+        });
+        fixup_macos_tun_inbounds(&mut cfg);
+        assert_eq!(cfg["inbounds"][0]["stack"], "system");
     }
 }
