@@ -139,6 +139,63 @@ pub fn apply_tun_overlay(merged: &mut Value, want_tun: Option<bool>) -> AppResul
     Ok(())
 }
 
+/// macOS's `utun` kernel control interface only accepts TUN device names of
+/// the form `utun<N>` (e.g. `utun3`). sing-box's Darwin backend rejects
+/// anything else at bring-up with
+/// `start inbound/tun: configure tun interface: bad tun name: <name>`,
+/// which then trips our 30s clash_api readiness wait and fails the launch.
+/// Our own default inbound uses the friendly `singbox0`, and user /
+/// subscription configs routinely carry names like `singbox_tun` — all fine
+/// on Linux/Windows, all fatal on macOS.
+///
+/// So, on macOS only, drop any TUN `interface_name` that isn't a valid
+/// `utunN`; sing-box then auto-assigns the first free utun unit. A valid
+/// `utunN` the user picked on purpose is preserved. No-op on Linux/Windows,
+/// where arbitrary names are legal and the friendly name aids identification
+/// and firewall rules.
+///
+/// Runs as the final step of config composition so it catches TUN inbounds
+/// from every source — our default, the user's file, and overrides alike.
+pub fn normalize_tun_interface_name(merged: &mut Value) {
+    if cfg!(target_os = "macos") {
+        strip_invalid_macos_tun_names(merged);
+    }
+}
+
+/// Platform-agnostic worker behind [`normalize_tun_interface_name`] (split
+/// out so it stays unit-testable off macOS): strip every TUN inbound's
+/// `interface_name` unless it is already a valid `utunN`.
+fn strip_invalid_macos_tun_names(merged: &mut Value) {
+    let Some(inbounds) = merged.get_mut("inbounds").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    for inbound in inbounds.iter_mut() {
+        if inbound.get("type").and_then(|v| v.as_str()) != Some("tun") {
+            continue;
+        }
+        let Some(obj) = inbound.as_object_mut() else {
+            continue;
+        };
+        let valid = obj
+            .get("interface_name")
+            .and_then(|v| v.as_str())
+            .is_some_and(is_valid_utun_name);
+        if !valid {
+            // Absent or invalid → remove so sing-box picks a free utun unit.
+            obj.remove("interface_name");
+        }
+    }
+}
+
+/// Does `name` match macOS's required `utun<N>` TUN naming (`utun0`,
+/// `utun7`, …)? Mirrors sing-box's Darwin `fmt.Sscanf(name, "utun%d")` gate,
+/// but stricter: the whole string must be `utun` followed by one or more
+/// decimal digits.
+fn is_valid_utun_name(name: &str) -> bool {
+    name.strip_prefix("utun")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Apply the user's chosen "proxy mode" (rule / global / direct) on top
 /// of the merged runtime config.
 ///
@@ -596,5 +653,78 @@ mod tests {
         let t = random_hex_token();
         assert_eq!(t.len(), 64);
         assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn utun_name_validity() {
+        // Valid: `utun` + one or more digits.
+        for ok in ["utun0", "utun7", "utun123"] {
+            assert!(is_valid_utun_name(ok), "{ok} should be valid");
+        }
+        // Invalid: our old default, the bug-report name, and edge cases.
+        for bad in ["singbox0", "singbox_tun", "tun0", "utun", "utunX", "utun1a", ""] {
+            assert!(!is_valid_utun_name(bad), "{bad} should be invalid");
+        }
+    }
+
+    #[test]
+    fn strips_invalid_tun_name_but_preserves_other_fields() {
+        let mut cfg = json!({
+            "inbounds": [{
+                "type": "tun",
+                "tag": "tun-in",
+                "interface_name": "singbox0",
+                "address": ["172.19.0.1/30"],
+                "auto_route": true,
+                "stack": "system"
+            }]
+        });
+        strip_invalid_macos_tun_names(&mut cfg);
+        let inb = &cfg["inbounds"][0];
+        assert!(inb.get("interface_name").is_none()); // stripped → auto-assign
+        assert_eq!(inb["tag"], "tun-in"); // everything else verbatim
+        assert_eq!(inb["address"], json!(["172.19.0.1/30"]));
+        assert_eq!(inb["auto_route"], json!(true));
+        assert_eq!(inb["stack"], "system");
+    }
+
+    #[test]
+    fn strips_user_singbox_tun_name() {
+        // The exact name from the macOS bug report.
+        let mut cfg = json!({
+            "inbounds": [{"type": "tun", "interface_name": "singbox_tun"}]
+        });
+        strip_invalid_macos_tun_names(&mut cfg);
+        assert!(cfg["inbounds"][0].get("interface_name").is_none());
+    }
+
+    #[test]
+    fn keeps_valid_utun_name() {
+        let mut cfg = json!({
+            "inbounds": [{"type": "tun", "interface_name": "utun9"}]
+        });
+        strip_invalid_macos_tun_names(&mut cfg);
+        assert_eq!(cfg["inbounds"][0]["interface_name"], "utun9");
+    }
+
+    #[test]
+    fn leaves_non_tun_inbounds_alone() {
+        // interface_name is meaningless on a mixed inbound; don't touch it.
+        let mut cfg = json!({
+            "inbounds": [{"type": "mixed", "interface_name": "whatever"}]
+        });
+        strip_invalid_macos_tun_names(&mut cfg);
+        assert_eq!(cfg["inbounds"][0]["interface_name"], "whatever");
+    }
+
+    #[test]
+    fn normalize_tolerates_missing_or_nonarray_inbounds() {
+        let mut no_inbounds = json!({"outbounds": []});
+        strip_invalid_macos_tun_names(&mut no_inbounds); // must not panic
+        assert!(no_inbounds.get("inbounds").is_none());
+
+        let mut weird = json!({"inbounds": "not-an-array"});
+        strip_invalid_macos_tun_names(&mut weird); // must not panic
+        assert_eq!(weird["inbounds"], "not-an-array");
     }
 }
